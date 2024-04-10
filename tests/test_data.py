@@ -56,5 +56,5 @@ class TestData:
         assert jnp.allclose(W.T @ W, jnp.eye(d), rtol=TINY, atol=TINY)
 
         # assert that the columns of v are in the span of W
-        assert jnp.allclose(W @ W.T @ V[0], V[0])
+        assert jnp.allclose(W @ W.T @ V[0], V[0], rtol=TINY, atol=TINY), jnp.max(jnp.abs(W @ W.T @ V[0] - V[0]))
 

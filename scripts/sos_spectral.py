@@ -14,8 +14,7 @@ def sos_method(S):
     """
     The sum-of-squares method from: https://arxiv.org/pdf/1512.02337.pdf
     args:
-        S (jnp.array): an (n,d) array, where n is the ambient dimension, 
-        d is number of vectors
+        S (jnp.array): an (n,d) array, where n is the ambient dimension, d is number of vectors
     """
     n,d = S.shape
 
@@ -32,6 +31,7 @@ def map_and_loss(model, x, y):
     """
     Map x using the model,
     args:
+        model (functional): function on a single input, will be vmapped
         x (jnp.array): input data, shape (batch,n,d)
         y (jnp.array): output data, the sparse vector, shape (batch,n)
     """
@@ -44,12 +44,13 @@ class SparseVectorHunterDiagonal(eqx.Module):
 
     def __init__(self, n, width, num_hidden_layers, key):
         """
-        Constructor for SparseVectorHunter
+        Constructor for SparseVectorHunter that only works with inner product of rows with itself
+        as inputs, and a basis of each rows outer product with itself.
         args:
             n (int): number of input vectors
             width (int): width of the NN layers
             num_hidden_layers (int): number of hidden layers, input/output of width
-            key (rand key): the 
+            key (rand key): the random key
         """
         in_features = n
         out_features = n + 1
@@ -85,7 +86,7 @@ class SparseVectorHunterDiagonal(eqx.Module):
 
         _, eigvecs = jnp.linalg.eigh(A) # ascending order
         assert eigvecs.shape == (d,d)
-        u = eigvecs[...,-1] # the eigenvector corresponding to the top eigenvector
+        u = eigvecs[...,-1] # the eigenvector corresponding to the top eigenvalue
         return S @ u
   
 class SparseVectorHunter(eqx.Module):
@@ -93,12 +94,12 @@ class SparseVectorHunter(eqx.Module):
 
     def __init__(self, n, width, num_hidden_layers, key):
         """
-        Constructor for SparseVectorHunter
+        Constructor for SparseVectorHunter, parameterizes full function from vectors to 2-tensor.
         args:
             n (int): number of input vectors
             width (int): width of the NN layers
             num_hidden_layers (int): number of hidden layers, input/output of width
-            key (rand key): the 
+            key (rand key): the  random key
         """
         in_features = n**2
         out_features = n + 1 + (n*(n-1)//2)
