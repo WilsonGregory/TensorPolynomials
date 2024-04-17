@@ -170,12 +170,14 @@ class SparseVectorHunter(eqx.Module):
 # Main
 key = random.PRNGKey(time.time_ns())
 key, subkey = random.split(key)
+train = True
+save = True
 
 # define data params
 n = 100
 d = 5
-eps = 0.3
-train_size = 2000
+eps = 0.25
+train_size = 5000
 val_size = 500
 test_size = 500
 
@@ -200,57 +202,66 @@ covariances = [RAND_COV, DIAG_COV, UNIT_COV]
 
 results = np.zeros((trials,len(samplings),len(covariances),len(models)+2,2))
 
-for t in range(trials):
-    for i, v0_sampling in enumerate(samplings):
-        for j, cov_type in enumerate(covariances):
-            key, subkey1, subkey2, subkey3, subkey4 = random.split(key, 5)
+if train:
+    for t in range(trials):
+        for i, v0_sampling in enumerate(samplings):
+            for j, cov_type in enumerate(covariances):
+                key, subkey1, subkey2, subkey3, subkey4 = random.split(key, 5)
 
-            if cov_type == RAND_COV:
-                # Random covariance matrix, force it to be pos. def.
-                M = random.normal(subkey4, shape=(n,n))
-                cov = M.T @ M + (1e-5)*jnp.eye(n)
-            elif cov_type == DIAG_COV:
-                # Random diagonal covariance matrix
-                cov = jnp.diag(random.uniform(subkey, shape=(n,)))
-            elif cov_type == UNIT_COV:
-                # No covariance, use 1/n * Id
-                cov = None
-            else:
-                raise Exception(f'No covariance {cov}')
+                if cov_type == RAND_COV:
+                    # Random covariance matrix, force it to be pos. def.
+                    M = random.normal(subkey4, shape=(n,n))
+                    cov = M.T @ M + (1e-5)*jnp.eye(n)
+                elif cov_type == DIAG_COV:
+                    # Random diagonal covariance matrix
+                    cov = jnp.diag(random.uniform(subkey, shape=(n,)))
+                elif cov_type == UNIT_COV:
+                    # No covariance, use 1/n * Id
+                    cov = None
+                else:
+                    raise Exception(f'No covariance {cov}')
 
-            # (batch,n), (batch,n,d)
-            train_v0, train_W = tpoly_data.get_synthetic_data(subkey1, n, d, eps, train_size, v0_sampling, cov) 
-            val_v0, val_W = tpoly_data.get_synthetic_data(subkey2, n, d, eps, val_size, v0_sampling, cov)
-            test_v0, test_W = tpoly_data.get_synthetic_data(subkey3, n, d, eps, test_size, v0_sampling, cov)
+                # (batch,n), (batch,n,d)
+                train_v0, train_W = tpoly_data.get_synthetic_data(subkey1, n, d, eps, train_size, v0_sampling, cov) 
+                val_v0, val_W = tpoly_data.get_synthetic_data(subkey2, n, d, eps, val_size, v0_sampling, cov)
+                test_v0, test_W = tpoly_data.get_synthetic_data(subkey3, n, d, eps, test_size, v0_sampling, cov)
 
-            results[t,i,j,0,0] = 1 - map_and_loss(sos_method, train_W, train_v0)
-            results[t,i,j,0,1] = 1 - map_and_loss(sos_method, test_W, test_v0)
-            print(f'{t},{v0_sampling},{cov_type},sos: {results[t,i,j,0,1]}')
+                results[t,i,j,0,0] = 1 - map_and_loss(sos_method, train_W, train_v0)
+                results[t,i,j,0,1] = 1 - map_and_loss(sos_method, test_W, test_v0)
+                print(f'{t},{v0_sampling},{cov_type},sos: {results[t,i,j,0,1]}')
 
-            results[t,i,j,1,0] = 1 - map_and_loss(sos_methodII, train_W, train_v0)
-            results[t,i,j,1,1] = 1 - map_and_loss(sos_methodII, test_W, test_v0)
-            print(f'{t},{v0_sampling},{cov_type},sosII: {results[t,i,j,1,1]}')
+                results[t,i,j,1,0] = 1 - map_and_loss(sos_methodII, train_W, train_v0)
+                results[t,i,j,1,1] = 1 - map_and_loss(sos_methodII, test_W, test_v0)
+                print(f'{t},{v0_sampling},{cov_type},sosII: {results[t,i,j,1,1]}')
 
-            for k, (model_name, model) in enumerate(models):
-                key, subkey = random.split(key)
-                trained_model, _, _ = ml.train(
-                    model, 
-                    map_and_loss, 
-                    train_W, 
-                    train_v0, 
-                    subkey, 
-                    ml.ValLoss(patience=20, verbose=verbose),
-                    optax.adam(optax.exponential_decay(learning_rate, int(train_size/batch_size), 0.999)), 
-                    batch_size, 
-                    val_W, 
-                    val_v0,
-                )
+                for k, (model_name, model) in enumerate(models):
+                    key, subkey = random.split(key)
+                    trained_model, _, _ = ml.train(
+                        model, 
+                        map_and_loss, 
+                        train_W, 
+                        train_v0, 
+                        subkey, 
+                        ml.ValLoss(patience=20, verbose=verbose),
+                        optax.adam(optax.exponential_decay(learning_rate, int(train_size/batch_size), 0.999)), 
+                        batch_size, 
+                        val_W, 
+                        val_v0,
+                    )
 
-                results[t,i,j,k+2,0] = 1 - map_and_loss(trained_model, train_W, train_v0)
-                results[t,i,j,k+2,1] = 1 - map_and_loss(trained_model, test_W, test_v0)
-                print(f'{t},{v0_sampling},{cov_type},{model_name}: {results[t,i,j,k+2,1]}')
-            
-            jnp.save(f'../runs/sparse_vector_results_lr{learning_rate}_n{n}_d{d}_eps{eps}.npy', results)
+                    results[t,i,j,k+2,0] = 1 - map_and_loss(trained_model, train_W, train_v0)
+                    results[t,i,j,k+2,1] = 1 - map_and_loss(trained_model, test_W, test_v0)
+                    print(f'{t},{v0_sampling},{cov_type},{model_name}: {results[t,i,j,k+2,1]}')
+                
+                if save:
+                    jnp.save(f'../runs/sparse_vector_results_lr{learning_rate}_N{train_size}_n{n}_d{d}_eps{eps}.npy', results)
+else:
+    results = jnp.load(f'../runs/sparse_vector_results_lr{learning_rate}_N{train_size}_n{n}_d{d}_eps{eps}.npy')
 
-print(results)
-print(jnp.mean(results, axis=0))
+mean_results = jnp.mean(results, axis=0)
+print_models = [('sos', sos_method), ('sosII', sos_methodII)] + models
+for i, v0_sampling in enumerate(samplings):
+    print(f'\nv0_sampling: {v0_sampling}')
+    for j, cov_type in enumerate(covariances):
+        print(f'cov_type: {cov_type}')
+        print(mean_results[i,j])
