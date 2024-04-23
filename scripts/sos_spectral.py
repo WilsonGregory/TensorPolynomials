@@ -10,9 +10,9 @@ import optax
 import tensorpolynomials.data as tpoly_data
 import tensorpolynomials.ml as ml
 
-RAND_COV = 'random_covariance'
-DIAG_COV = 'diagonal_covariance'
-UNIT_COV = 'unit_covariance'
+RAND_COV = 'Random'
+DIAG_COV = 'Diagonal'
+UNIT_COV = 'Identity'
 
 def sos_method(S):
     """
@@ -170,8 +170,9 @@ class SparseVectorHunter(eqx.Module):
 # Main
 key = random.PRNGKey(time.time_ns())
 key, subkey = random.split(key)
-train = True
-save = True
+train = False
+save = False
+table_print = True
 
 # define data params
 n = 100
@@ -186,7 +187,7 @@ width = 128
 depth = 2
 batch_size = 100
 learning_rate = 3e-4
-trials = 5
+trials = 10
 verbose = 0
 
 key, subkey1, subkey2 = random.split(key, 3)
@@ -197,7 +198,8 @@ models = [
 for model_name, model in models:
     print(f'{model_name}: {sum([x.size for x in jax.tree_util.tree_leaves(model)]):,} params')
     
-samplings = [tpoly_data.V0_NORMAL,tpoly_data.V0_BERN_GAUS,tpoly_data.V0_BERN_RAD,tpoly_data.V0_KSPARSE]
+# samplings = [tpoly_data.V0_NORMAL,tpoly_data.V0_BERN_GAUS,tpoly_data.V0_BERN_RAD,tpoly_data.V0_KSPARSE]
+samplings = [tpoly_data.V0_NORMAL,tpoly_data.V0_BERN_GAUS,tpoly_data.V0_BERN_RAD]
 covariances = [RAND_COV, DIAG_COV, UNIT_COV]
 
 results = np.zeros((trials,len(samplings),len(covariances),len(models)+2,2))
@@ -259,9 +261,43 @@ else:
     results = jnp.load(f'../runs/sparse_vector_results_lr{learning_rate}_N{train_size}_n{n}_d{d}_eps{eps}.npy')
 
 mean_results = jnp.mean(results, axis=0)
+std_results = jnp.std(results, axis=0)
 print_models = [('sos', sos_method), ('sosII', sos_methodII)] + models
-for i, v0_sampling in enumerate(samplings):
-    print(f'\nv0_sampling: {v0_sampling}')
-    for j, cov_type in enumerate(covariances):
-        print(f'cov_type: {cov_type}')
-        print(mean_results[i,j])
+if table_print:
+    mean_results = jnp.around(mean_results, 3)
+    std_results = jnp.around(std_results, 3)
+
+    for l in [0,1]: # train is 0, test is 1
+        if l == 0:
+            print('Train')
+        else:
+            print('Test')
+
+        print('\\hline')
+        for i, v0_sampling in enumerate(samplings):
+            for j, cov_type in enumerate(covariances):
+                if j == (len(covariances) // 2):
+                    print(f'{v0_sampling} ', end='')
+
+                print(f'& {cov_type} ', end='')
+
+                for k in range(len(print_models)):
+                    if jnp.allclose(mean_results[i,j,k,l], jnp.max(mean_results[i,j,:,l])):
+                        print(f'& \\textbf{"{"}{mean_results[i,j,k,l]:.3f} $\\pm$ {std_results[i,j,k,l]:.3f}{"}"} ', end='')
+                    else:
+                        print(f'& {mean_results[i,j,k,l]:.3f} $\\pm$ {std_results[i,j,k,l]:.3f} ', end='')
+
+                print('\\\\')
+
+            print('\\hline')
+        
+        print('\n')
+else:
+    for i, v0_sampling in enumerate(samplings):
+        print(f'\nv0_sampling: {v0_sampling}')
+        for j, cov_type in enumerate(covariances):
+            print(f'cov_type: {cov_type}')
+            print(mean_results[i,j])
+            print(f'+ {std_results[i,j]}')
+
+
