@@ -172,6 +172,7 @@ key = random.PRNGKey(time.time_ns())
 key, subkey = random.split(key)
 train = False
 save = False
+save_dir = '../runs/'
 table_print = True
 
 # define data params
@@ -256,9 +257,12 @@ if train:
                     print(f'{t},{v0_sampling},{cov_type},{model_name}: {results[t,i,j,k+2,1]}')
                 
                 if save:
-                    jnp.save(f'../runs/sparse_vector_results_lr{learning_rate}_N{train_size}_n{n}_d{d}_eps{eps}.npy', results)
+                    jnp.save(
+                        f'{save_dir}/sparse_vector_results_lr{learning_rate}_N{train_size}_n{n}_d{d}_eps{eps}.npy',
+                        results,
+                    )
 else:
-    results = jnp.load(f'../runs/sparse_vector_results_lr{learning_rate}_N{train_size}_n{n}_d{d}_eps{eps}.npy')
+    results = jnp.load(f'{save_dir}/sparse_vector_results_lr{learning_rate}_N{train_size}_n{n}_d{d}_eps{eps}.npy')
 
 mean_results = jnp.mean(results, axis=0)
 std_results = jnp.std(results, axis=0)
