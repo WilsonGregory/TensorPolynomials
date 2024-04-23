@@ -7,9 +7,9 @@ import jax.random as random
 
 TINY = 1e-5
 
-V0_NORMAL = 'v0_normal'
-V0_BERN_GAUS = 'v0_bernoulli_gaussian'
-V0_BERN_RAD = 'v0_bernoulli_rademacher'
+V0_NORMAL = 'Accept/Reject'
+V0_BERN_GAUS = 'Bernoulli-Gaussian'
+V0_BERN_RAD = 'Bernoulli-Rademacher'
 V0_KSPARSE = 'v0_ksparse'
 
 def get_sparse_vector(key, n, eps, batch, v0_sampling=V0_NORMAL):
