@@ -61,6 +61,51 @@ def map_and_loss(model, x, y):
     squared_dots = jnp.einsum('...i,...i->...', y, pred_y)**2
     return 1 - jnp.mean(squared_dots)
 
+class BaselineLearnedModel(eqx.Module):
+    layers: list
+
+    def __init__(self, n, d, width, num_hidden_layers, key):
+        """
+        Constructor for SparseVectorHunter that only works with inner product of rows with itself
+        as inputs, and a basis of each rows outer product with itself.
+        args:
+            n (int): number of input vectors
+            width (int): width of the NN layers
+            num_hidden_layers (int): number of hidden layers, input/output of width
+            key (rand key): the random key
+        """
+        in_features = n * d
+        out_features = d * d
+
+        key, subkey = random.split(key)
+        self.layers = [eqx.nn.Linear(in_features, width, key=subkey)]
+        for _ in range(num_hidden_layers):
+            key, subkey = random.split(key)
+            self.layers.append(eqx.nn.Linear(width, width, key=subkey))
+
+        key, subkey = random.split(key)
+        self.layers.append(eqx.nn.Linear(width, out_features, key=subkey))
+
+    def __call__(self, S):
+        """
+        args:
+            S (jnp.array): (n,d) array, d vectors in R^n, but we treat them as n vectors in R^d
+        """
+        n,d = S.shape
+        X = S.reshape(-1)
+        assert X.shape == (n*d,)
+
+        for layer in self.layers[:-1]:
+            X = jax.nn.relu(layer(X))
+
+        A = self.layers[-1](X).reshape((d,d))
+        assert A.shape == (d,d)
+
+        _, eigvecs = jnp.linalg.eigh(A) # ascending order
+        assert eigvecs.shape == (d,d)
+        u = eigvecs[...,-1] # the eigenvector corresponding to the top eigenvalue
+        return S @ u
+
 class SparseVectorHunterDiagonal(eqx.Module):
     layers: list
 
@@ -110,7 +155,7 @@ class SparseVectorHunterDiagonal(eqx.Module):
         assert eigvecs.shape == (d,d)
         u = eigvecs[...,-1] # the eigenvector corresponding to the top eigenvalue
         return S @ u
-  
+
 class SparseVectorHunter(eqx.Module):
     layers: list
 
@@ -123,7 +168,7 @@ class SparseVectorHunter(eqx.Module):
             num_hidden_layers (int): number of hidden layers, input/output of width
             key (rand key): the  random key
         """
-        in_features = n**2
+        in_features = n + (n*(n-1)//2)
         out_features = n + 1 + (n*(n-1)//2)
 
         key, subkey = random.split(key)
@@ -141,8 +186,8 @@ class SparseVectorHunter(eqx.Module):
             S (jnp.array): (n,d) array, d vectors in R^n, but we treat them as n vectors in R^d
         """
         n,d = S.shape
-        X = (S @ S.T).reshape(-1) # n**2
-        assert X.shape == (n**2,)
+        X = (S @ S.T)[jnp.triu_indices(n)].reshape(-1)
+        assert X.shape == (n + n*(n-1)//2,)
 
         for layer in self.layers[:-1]:
             X = jax.nn.relu(layer(X))
@@ -170,8 +215,8 @@ class SparseVectorHunter(eqx.Module):
 # Main
 key = random.PRNGKey(time.time_ns())
 key, subkey = random.split(key)
-train = False
-save = False
+train = True
+save = True
 save_dir = '../runs/'
 table_print = True
 
@@ -187,20 +232,24 @@ test_size = 500
 width = 128
 depth = 2
 batch_size = 100
-learning_rate = 3e-4
-trials = 10
+trials = 5
 verbose = 0
 
-key, subkey1, subkey2 = random.split(key, 3)
+key, subkey1, subkey2, subkey3 = random.split(key, 4)
 models = [
-    ('sparseDiagonal', SparseVectorHunterDiagonal(n, width, depth, subkey1)), # n inputs, n+1 outputs
-    ('sparse', SparseVectorHunter(n, width, depth, subkey2)), # n**2 inputs, n+1+(n(n-1)/2) outputs
+    ('baselineLearned', 1e-3, BaselineLearnedModel(n, d, width, depth, subkey1)), # n*d inputs, d*d outputs
+    ('sparseDiagonal', 5e-4, SparseVectorHunterDiagonal(n, width, depth, subkey2)), # n inputs, n+1 outputs
+    ('sparse', 3e-4, SparseVectorHunter(n, width, depth, subkey3)), # n+(n(n-1)/2) inputs, n+1+(n(n-1)/2) outputs
 ]
-for model_name, model in models:
+for model_name, lr, model in models:
     print(f'{model_name}: {sum([x.size for x in jax.tree_util.tree_leaves(model)]):,} params')
-    
-# samplings = [tpoly_data.V0_NORMAL,tpoly_data.V0_BERN_GAUS,tpoly_data.V0_BERN_RAD,tpoly_data.V0_KSPARSE]
-samplings = [tpoly_data.V0_NORMAL,tpoly_data.V0_BERN_GAUS,tpoly_data.V0_BERN_RAD]
+
+samplings = [
+    tpoly_data.V0_NORMAL,
+    tpoly_data.V0_BERN_GAUS,
+    tpoly_data.V0_BERN_DUB_GAUS,
+    tpoly_data.V0_BERN_RAD,
+]
 covariances = [RAND_COV, DIAG_COV, UNIT_COV]
 
 results = np.zeros((trials,len(samplings),len(covariances),len(models)+2,2))
@@ -217,7 +266,7 @@ if train:
                     cov = M.T @ M + (1e-5)*jnp.eye(n)
                 elif cov_type == DIAG_COV:
                     # Random diagonal covariance matrix
-                    cov = jnp.diag(random.uniform(subkey, shape=(n,)))
+                    cov = jnp.diag(random.uniform(subkey, shape=(n,), minval=0.5, maxval=1.5))
                 elif cov_type == UNIT_COV:
                     # No covariance, use 1/n * Id
                     cov = None
@@ -237,7 +286,7 @@ if train:
                 results[t,i,j,1,1] = 1 - map_and_loss(sos_methodII, test_W, test_v0)
                 print(f'{t},{v0_sampling},{cov_type},sosII: {results[t,i,j,1,1]}')
 
-                for k, (model_name, model) in enumerate(models):
+                for k, (model_name, lr, model) in enumerate(models):
                     key, subkey = random.split(key)
                     trained_model, _, _ = ml.train(
                         model, 
@@ -246,7 +295,7 @@ if train:
                         train_v0, 
                         subkey, 
                         ml.ValLoss(patience=20, verbose=verbose),
-                        optax.adam(optax.exponential_decay(learning_rate, int(train_size/batch_size), 0.999)), 
+                        optax.adam(optax.exponential_decay(lr, int(train_size/batch_size), 0.999)), 
                         batch_size, 
                         val_W, 
                         val_v0,
@@ -258,11 +307,11 @@ if train:
                 
                 if save:
                     jnp.save(
-                        f'{save_dir}/sparse_vector_results_lr{learning_rate}_N{train_size}_n{n}_d{d}_eps{eps}.npy',
+                        f'{save_dir}/sparse_vector_results_t{trials}_N{train_size}_n{n}_d{d}_eps{eps}.npy',
                         results,
                     )
 else:
-    results = jnp.load(f'{save_dir}/sparse_vector_results_lr{learning_rate}_N{train_size}_n{n}_d{d}_eps{eps}.npy')
+    results = jnp.load(f'{save_dir}/sparse_vector_results_t{trials}_N{train_size}_n{n}_d{d}_eps{eps}.npy')
 
 mean_results = jnp.mean(results, axis=0)
 std_results = jnp.std(results, axis=0)
