@@ -13,6 +13,16 @@ V0_BERN_DUB_GAUS = 'Bernoulli-Dual-Gaussian'
 V0_BERN_RAD = 'Bernoulli-Rademacher'
 V0_KSPARSE = 'v0_ksparse'
 
+def nonzero_and_norm(vecs):
+    """
+    Take vecs, remove those with 0 norm, then normalize the rest.
+    args:
+        vecs (jnp.array): vecs of shape (batch,n)
+    """
+    norms = jnp.linalg.norm(vecs, axis=1) # (batch,)
+    vecs = vecs[norms > TINY]
+    return vecs / norms[norms > TINY,None]
+
 def get_sparse_vector(key, n, eps, batch, v0_sampling=V0_NORMAL):
     """
     Generate batch sparse vectors in R^n according to different strategies.
@@ -58,10 +68,7 @@ def get_sparse_vector(key, n, eps, batch, v0_sampling=V0_NORMAL):
             bernoulli = random.uniform(subkey2, shape=(batch,n))
             vecs = jnp.where(bernoulli < eps, entries, jnp.zeros(entries.shape))
 
-            norms = jnp.linalg.norm(vecs, axis=1) # (batch,)
-            vecs = vecs[norms > TINY]
-            normed_vecs = vecs / norms[norms > TINY,None]
-
+            normed_vecs = nonzero_and_norm(vecs)
             sparse_vecs = jnp.concatenate([sparse_vecs, normed_vecs])
 
         sparse_vecs = sparse_vecs[:batch]
@@ -89,10 +96,7 @@ def get_sparse_vector(key, n, eps, batch, v0_sampling=V0_NORMAL):
             bernoulli = random.uniform(subkey3, shape=(batch,n))
             vecs = jnp.where(bernoulli < eps, big_entries, little_entries)
 
-            norms = jnp.linalg.norm(vecs, axis=1) # (batch,)
-            vecs = vecs[norms > TINY]
-            normed_vecs = vecs / norms[norms > TINY,None]
-
+            normed_vecs = nonzero_and_norm(vecs)
             sparse_vecs = jnp.concatenate([sparse_vecs, normed_vecs])
 
         sparse_vecs = sparse_vecs[:batch]
@@ -107,11 +111,7 @@ def get_sparse_vector(key, n, eps, batch, v0_sampling=V0_NORMAL):
             signed_entries = jnp.where(bernoulli < 0.5, entries, -1*entries)
             vecs = jnp.where(bernoulli < eps, signed_entries, jnp.zeros(signed_entries.shape))
 
-            norms = jnp.linalg.norm(vecs, axis=1) # (batch,)
-            vecs = vecs[norms > TINY]
-            normed_vecs = vecs / norms[norms > TINY,None]
-            normed_vecs = normed_vecs[jnp.sum(normed_vecs**4,axis=1) >= (1/(n*eps))]
-
+            normed_vecs = nonzero_and_norm(vecs)
             sparse_vecs = jnp.concatenate([sparse_vecs, normed_vecs])
 
         sparse_vecs = sparse_vecs[:batch]
@@ -164,7 +164,9 @@ def get_synthetic_data(key, n, d, eps, batch, v0_sampling=V0_NORMAL, cov=None):
 
         W = get_orthogonal_basis(subkey3, V) # (batch,n,d)
 
-        # this is a hack, but i need it
+        # Sometimes this is nan, I am not sure why. It also breaks the other models when
+        # this happens. I thought it might be some issue with normalizing/dividing by zero
+        # but it keeps happening. So for now, we will just do this.
         isnan = jnp.isnan(1 - map_and_loss(sos_method, W, v0))
 
     return v0, W
