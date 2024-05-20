@@ -14,6 +14,14 @@ RAND_COV = 'Random'
 DIAG_COV = 'Diagonal'
 UNIT_COV = 'Identity'
 
+sampling_print_names = {
+    tpoly_data.V0_NORMAL: 'A/R',
+    tpoly_data.V0_BERN_GAUS: 'BG',
+    tpoly_data.V0_BERN_DUB_GAUS: 'CBG',
+    tpoly_data.V0_BERN_RAD: 'BR',
+    tpoly_data.V0_KSPARSE: 'KS',
+}
+
 def sos_method(S):
     """
     The sum-of-squares method from: https://arxiv.org/pdf/1512.02337.pdf
@@ -61,6 +69,24 @@ def map_and_loss(model, x, y):
     squared_dots = jnp.einsum('...i,...i->...', y, pred_y)**2
     return 1 - jnp.mean(squared_dots)
 
+def fill_triangular(x, d):
+    """
+    Constructs an upper triangular matrix from x: https://github.com/google/jax/discussions/10146
+    Note that the order is a little funky, for example a 5x5 from 15 values will be:
+    array([[ 1,  2,  3,  4,  5],
+            [ 0,  7,  8,  9, 10],
+            [ 0,  0, 13, 14, 15],
+            [ 0,  0,  0, 12, 11],
+            [ 0,  0,  0,  0,  6]])
+    args:
+        x (jnp.array): array of values that we want to become the upper triangular matrix
+        d (int): the dimensions of the matrix we are making, d x d
+    """
+    assert len(x) == (d + d*(d-1)//2)
+    xc = jnp.concatenate([x, x[d:][::-1]])
+    y = jnp.reshape(xc, [d, d])
+    return jnp.triu(y, k=0)
+
 class BaselineLearnedModel(eqx.Module):
     layers: list
 
@@ -75,7 +101,7 @@ class BaselineLearnedModel(eqx.Module):
             key (rand key): the random key
         """
         in_features = n * d
-        out_features = d * d
+        out_features = d + (d * (d-1) // 2) # output array needs to be symmetric
 
         key, subkey = random.split(key)
         self.layers = [eqx.nn.Linear(in_features, width, key=subkey)]
@@ -98,7 +124,10 @@ class BaselineLearnedModel(eqx.Module):
         for layer in self.layers[:-1]:
             X = jax.nn.relu(layer(X))
 
-        A = self.layers[-1](X).reshape((d,d))
+        out = self.layers[-1](X)
+        upper_triangular = fill_triangular(out, d)
+        # subtract the diagonal because it will get added twice otherwise
+        A = upper_triangular + upper_triangular.T - jnp.diag(upper_triangular)
         assert A.shape == (d,d)
 
         _, eigvecs = jnp.linalg.eigh(A) # ascending order
@@ -330,7 +359,7 @@ if table_print:
         for i, v0_sampling in enumerate(samplings):
             for j, cov_type in enumerate(covariances):
                 if j == (len(covariances) // 2):
-                    print(f'{v0_sampling} ', end='')
+                    print(f'{sampling_print_names[v0_sampling]} ', end='')
 
                 print(f'& {cov_type} ', end='')
 
