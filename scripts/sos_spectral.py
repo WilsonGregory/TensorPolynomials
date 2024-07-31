@@ -9,6 +9,7 @@ import optax
 
 import tensorpolynomials.data as tpoly_data
 import tensorpolynomials.ml as ml
+import tensorpolynomials.utils as utils
 
 RAND_COV = 'Random'
 DIAG_COV = 'Diagonal'
@@ -69,24 +70,6 @@ def map_and_loss(model, x, y):
     squared_dots = jnp.einsum('...i,...i->...', y, pred_y)**2
     return 1 - jnp.mean(squared_dots)
 
-def fill_triangular(x, d):
-    """
-    Constructs an upper triangular matrix from x: https://github.com/google/jax/discussions/10146
-    Note that the order is a little funky, for example a 5x5 from 15 values will be:
-    array([[ 1,  2,  3,  4,  5],
-            [ 0,  7,  8,  9, 10],
-            [ 0,  0, 13, 14, 15],
-            [ 0,  0,  0, 12, 11],
-            [ 0,  0,  0,  0,  6]])
-    args:
-        x (jnp.array): array of values that we want to become the upper triangular matrix
-        d (int): the dimensions of the matrix we are making, d x d
-    """
-    assert len(x) == (d + d*(d-1)//2)
-    xc = jnp.concatenate([x, x[d:][::-1]])
-    y = jnp.reshape(xc, [d, d])
-    return jnp.triu(y, k=0)
-
 class BaselineLearnedModel(eqx.Module):
     layers: list
 
@@ -125,7 +108,7 @@ class BaselineLearnedModel(eqx.Module):
             X = jax.nn.relu(layer(X))
 
         out = self.layers[-1](X)
-        upper_triangular = fill_triangular(out, d)
+        upper_triangular = utils.fill_triangular(out, d)
         # subtract the diagonal because it will get added twice otherwise
         A = upper_triangular + upper_triangular.T - jnp.diag(upper_triangular)
         assert A.shape == (d,d)
@@ -241,6 +224,64 @@ class SparseVectorHunter(eqx.Module):
         u = eigvecs[...,-1] # the eigenvector corresponding to the top eigenvector
         return S @ u
 
+class SVHPerm(eqx.Module):
+    layers: list
+    last_layer_pairs: eqx.Module
+    last_layer_identity: eqx.Module
+
+    def __init__(self, n, width, num_hidden_layers, key):
+        """
+        Constructor for SVHPerm, parameterizes full function from vectors to 2-tensor.
+        args:
+            n (int): number of input vectors
+            width (int): width of the NN layers
+            num_hidden_layers (int): number of hidden layers, input/output of width
+            key (rand key): the random key
+        """
+        basis_sym_nonsym = utils.PermInvariantTensor.get(4,n,((0,1),))
+        basis_nonsym_nonsym = utils.PermInvariantTensor.get(4,n)
+        basis_nonsym_sym = basis_sym_nonsym.transpose((0,3,4,1,2))
+        bias_basis = utils.PermInvariantTensor.get(2,n)
+
+        key, subkey = random.split(key)
+        self.layers = [ml.GeneralLinear(basis_sym_nonsym,1,width,True,bias_basis,subkey)]
+        for _ in range(num_hidden_layers):
+            key, subkey = random.split(key)
+            self.layers.append(
+                ml.GeneralLinear(basis_nonsym_nonsym,width,width,True,bias_basis,key=subkey),
+            )
+
+        key, subkey1, subkey2 = random.split(key, 3)
+        self.last_layer_pairs = ml.GeneralLinear(basis_nonsym_sym,width,1,True,bias_basis,subkey1)
+        self.last_layer_identity = ml.GeneralLinear(bias_basis,width,1,True,jnp.ones((1,1)),subkey2)
+
+    def __call__(self, S):
+        """
+        args:
+            S (jnp.array): (n,d) array, d vectors in R^n, but we treat them as n vectors in R^d
+        """
+        n,d = S.shape
+        X = (S @ S.T)[None]
+        assert X.shape == (1,n,n)
+
+        for layer in self.layers:
+            X = jax.nn.leaky_relu(layer(X))
+
+        pairs = self.last_layer_pairs(X)
+        assert pairs.shape == (1,n,n), f'{pairs.shape}'
+        identity_scalar = self.last_layer_identity(X)
+        
+        # Now get a basis consisting of outer products of all pairs of rows.
+        pairs_basis = jnp.einsum('ab,cd->acbd', S, S)
+        assert pairs_basis.shape == (n,n,d,d)
+
+        A = jnp.einsum('ab,abcd->cd', pairs[0], pairs_basis) + identity_scalar * jnp.eye(d)
+
+        _, eigvecs = jnp.linalg.eigh(A) # ascending order
+        assert eigvecs.shape == (d,d)
+        u = eigvecs[...,-1] # the eigenvector corresponding to the top eigenvector
+        return S @ u
+
 # Main
 key = random.PRNGKey(time.time_ns())
 key, subkey = random.split(key)
@@ -264,11 +305,12 @@ batch_size = 100
 trials = 5
 verbose = 0
 
-key, subkey1, subkey2, subkey3 = random.split(key, 4)
+key, subkey1, subkey2, subkey3, subkey4 = random.split(key, 5)
 models = [
     ('baselineLearned', 1e-3, BaselineLearnedModel(n, d, width, depth, subkey1)), # n*d inputs, d*d outputs
     ('sparseDiagonal', 5e-4, SparseVectorHunterDiagonal(n, width, depth, subkey2)), # n inputs, n+1 outputs
     ('sparse', 3e-4, SparseVectorHunter(n, width, depth, subkey3)), # n+(n(n-1)/2) inputs, n+1+(n(n-1)/2) outputs
+    # ('sparsePerm', 1e-4, SVHPerm(n, 32, depth*2, subkey4)),
 ]
 for model_name, lr, model in models:
     print(f'{model_name}: {sum([x.size for x in jax.tree_util.tree_leaves(model)]):,} params')
@@ -316,6 +358,7 @@ if train:
                 print(f'{t},{v0_sampling},{cov_type},sosII: {results[t,i,j,1,1]}')
 
                 for k, (model_name, lr, model) in enumerate(models):
+                    steps_per_epoch = int(train_size/batch_size)
                     key, subkey = random.split(key)
                     trained_model, _, _ = ml.train(
                         model, 

@@ -4,8 +4,10 @@ pyproject.toml
 setup.cfg
 src/tensorpolynomials/__init__.py
 src/tensorpolynomials/data.py
+src/tensorpolynomials/ml.py
 src/tensorpolynomials.egg-info/PKG-INFO
 src/tensorpolynomials.egg-info/SOURCES.txt
 src/tensorpolynomials.egg-info/dependency_links.txt
 src/tensorpolynomials.egg-info/requires.txt
 src/tensorpolynomials.egg-info/top_level.txt
+tests/test_data.py

@@ -3,7 +3,72 @@ import math
 
 import jax.numpy as jnp
 import jax.random as random
+from jaxtyping import Array
 import equinox as eqx
+
+import tensorpolynomials.utils as utils
+
+class GeneralLinear(eqx.Module):
+    """
+    Performs a linear (affine) map, using a specified basis rather than the usual linear basis.
+    The basis for both the linear map and the bias must be specified.
+    """
+    basis: Array = eqx.field(static=True)
+    in_features: int = eqx.field(static=True)
+    out_features: int = eqx.field(static=True)
+    use_bias: bool = eqx.field(static=True)
+    bias_basis: Array = eqx.field(static=True)
+    weights: Array
+    bias: Array
+
+    def __init__(
+            self, 
+            basis: Array, 
+            in_features: int,
+            out_features: int, 
+            use_bias: bool = True, 
+            bias_basis: Array = None,
+            key = None,
+        ):
+        self.basis = basis
+        self.in_features = in_features
+        self.out_features = out_features
+        self.use_bias = use_bias
+        self.bias_basis = bias_basis
+
+        wkey, bkey = random.split(key)
+
+        lim = 1 / math.sqrt(in_features*len(self.basis))
+        self.weights = random.uniform(
+            wkey, 
+            shape=(out_features, in_features, len(self.basis)), 
+            minval=-lim, 
+            maxval=lim,
+        )
+
+        if self.use_bias:
+            self.bias = random.uniform(
+                bkey, 
+                shape=(out_features, len(self.bias_basis)), 
+                minval=-lim, 
+                maxval=lim,
+            )
+        else:
+            self.bias = None
+
+    def __call__(self, x: Array, key = None):
+        in_k = x.ndim - 1
+        out_k = self.basis.ndim - in_k - 1
+        tensor_map = jnp.einsum('abc,c...->ab...', self.weights, self.basis) # (out,in,) + (n,)*k
+
+        in_k_str = utils.LETTERS[2:2+in_k]
+        out_k_str = utils.LETTERS[2+in_k:2+in_k+out_k]
+        out = jnp.einsum(f'a{in_k_str},ba{in_k_str}{out_k_str}->b{out_k_str}', x, tensor_map)
+
+        if self.use_bias:
+            out = out + jnp.einsum('ab,b...->a...', self.bias, self.bias_basis)
+        
+        return out
 
 ## Data and Batching operations
 
@@ -29,11 +94,11 @@ class StopCondition:
     def stop(self, model, current_epoch, train_loss, val_loss, batch_time):
         pass
 
-    def log_status(self, epoch, train_loss, val_loss, batch_time):
+    def log_status(self, epoch, train_loss, val_loss, batch_time, emph=False):
         if (train_loss is not None):
             if (val_loss is not None):
                 print(
-                    f'Epoch {epoch} Train: {train_loss:.7f} Val: {val_loss:.7f} Batch time: {batch_time:.5f}',
+                    f'{'> ' if emph else ''}Epoch {epoch} Train: {train_loss:.7f} Val: {val_loss:.7f} Batch time: {batch_time:.5f}',
                 )
             else:
                 print(f'Epoch {epoch} Train: {train_loss:.7f} Batch time: {batch_time:.5f}')
@@ -102,9 +167,11 @@ class ValLoss(StopCondition):
             self.epochs_since_best = 0
 
             if (self.verbose >= 1):
-                self.log_status(current_epoch, train_loss, val_loss, batch_time)
+                self.log_status(current_epoch, train_loss, val_loss, batch_time, emph=True)
         else:
             self.epochs_since_best += 1
+            if self.verbose >= 2:
+                self.log_status(current_epoch, train_loss, val_loss, batch_time)
 
         return self.epochs_since_best > self.patience
 
