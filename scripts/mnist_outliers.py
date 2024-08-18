@@ -3,10 +3,12 @@ import functools
 import numpy as np
 from mnist import MNIST
 import matplotlib.pyplot as plt
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
 import jax.random as random
+from jaxtyping import ArrayLike, PyTree
 import optax
 import equinox as eqx
 
@@ -14,14 +16,28 @@ import tensorpolynomials.data as tpoly_data
 import tensorpolynomials.models as models
 import tensorpolynomials.ml as ml
 
-def labels_only(data_labels, labels):
+def labels_only(data_labels: ArrayLike, labels: ArrayLike) -> jax.Array:
+    """
+    For array of data_labels, include that row if the label is in labels.
+    """
     return functools.reduce(
         lambda carry, label: carry | (data_labels == label), 
         labels, 
         jnp.full_like(data_labels, False, dtype=bool),
     )
 
-def load_mnist(dir, key, labels, train_size, val_size, test_size, normalize_length=True):
+def load_mnist(
+    dir: str, 
+    key: ArrayLike, 
+    labels: ArrayLike, 
+    train_size: int, 
+    val_size: int, 
+    test_size: int, 
+    normalize_length: bool = True,
+) -> tuple[jax.Array]:
+    """
+    Load mnist train and test data, and also split out a validation set.
+    """
     mndata = MNIST(dir)
     train_images, train_labels = mndata.load_training()
     test_images, test_labels = mndata.load_testing()
@@ -58,7 +74,16 @@ def load_mnist(dir, key, labels, train_size, val_size, test_size, normalize_leng
 
     return train_images, train_labels, val_images, val_labels, test_images, test_labels
 
-def normalize_and_noise(data, key, d, noise_type='choice256_rotate', noise_var=None):
+def normalize_and_noise(
+    data: ArrayLike, 
+    key: ArrayLike, 
+    d: int, 
+    noise_type: str = 'choice256_rotate', 
+    noise_var: Optional[float] = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """
+    Add noise to the input data and normalize it to unit length.
+    """
     num_points, img_size = data.shape
     key, subkey1, subkey2, subkey3 = random.split(key, 4)
 
@@ -105,7 +130,7 @@ def normalize_and_noise(data, key, d, noise_type='choice256_rotate', noise_var=N
 
     return aug_data_orthogonal, normalized_data, aug_data # (batch,n,d)
 
-def map_and_loss(model, x, y):
+def map_and_loss(model: PyTree, x: ArrayLike, y: ArrayLike) -> float:
     """
     Map x using the model,
     args:
@@ -119,7 +144,7 @@ def map_and_loss(model, x, y):
 
 dir = '/data/wgregor4/mnist'
 n = 28 ** 2
-d = 20 # problems with having enough memory
+d = 20
 width = 128
 depth = 2
 train_size = 900
@@ -127,7 +152,7 @@ val_size = 100
 test_size = 100
 labels = jnp.arange(10)
 
-train = False
+train = True
 save = False
 load_results = False
 save_dir = '../runs/sparse_vector/'
@@ -154,7 +179,6 @@ train_sparse, train_labels, val_sparse, val_labels, test_sparse, test_labels = l
 train_size = len(train_sparse)
 batch_size = 10
 
-# lrs are currently untuned
 key, subkey1, subkey2, subkey3, subkey4 = random.split(key, 5)
 models_list = [
     # ('baselineCNN', 'CNN', 1e-3, models.BaselineCNN(d,width,subkey4)),
@@ -163,7 +187,6 @@ models_list = [
     ('sparse', 'SVH', 3e-4, models.SparseVectorHunter(n, width, depth, subkey3)), # n+(n(n-1)/2) inputs, n+1+(n(n-1)/2) outputs
 ]
 
-# noise_types = [('choice256_rotate',None), ('normal_rotate',None), ('normal',0.05), ('mask',0.3), ('block', 12)]
 noise_types = [
     ('normal_rotate', 'Subspace', None), 
     ('normal', 'Gaussian', 0.05), 

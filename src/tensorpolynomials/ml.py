@@ -4,7 +4,7 @@ import functools
 
 import jax.numpy as jnp
 import jax.random as random
-from jaxtyping import Array
+from jaxtyping import Array, ArrayLike, PyTree
 import equinox as eqx
 
 import tensorpolynomials.utils as utils
@@ -184,29 +184,24 @@ def make_step(map_and_loss, model, optim, opt_state, x, y):
 
 def map_loss_in_batches(
     map_and_loss,
-    model,
-    X,
-    Y, 
-    batch_size,
-    rand_key,
+    model: PyTree,
+    X: ArrayLike,
+    Y: ArrayLike, 
+    batch_size: int,
+    rand_key: ArrayLike,
 ):
     """
-    Runs map_and_loss for the entire layer_X, layer_Y, splitting into batches if the layer is larger than
+    Runs map_and_loss for the entire X, Y, splitting into batches if the data is larger than
     the batch_size. This is helpful to run a whole validation/test set through map and loss when you need
-    to split those over batches for memory reasons. Automatically pmaps over multiple gpus, so the number 
-    of gpus must evenly divide batch_size as well as as any remainder of the layer.
+    to split those over batches for memory reasons.
     args:
         map_and_loss (function): function that takes in params, X_batch, Y_batch, rand_key, train, and 
             aux_data if has_aux is true, and returns the loss, and aux_data if has_aux is true.
-        params (params tree): the params to run through map_and_loss
-        layer_X (BatchLayer): input data
-        layer_Y (BatchLayer): target output data
+        model (PyTree): the model that the data is run through
+        X (ArrayLike): input data
+        Y (ArrayLike): target output data
         batch_size (int): effective batch_size, must be divisible by number of gpus
         rand_key (jax.random.PRNGKey): rand key
-        train (bool): whether this is training or not, likely not
-        has_aux (bool): has auxilliary data, such as batch_stats, defaults to False
-        aux_data (any): auxilliary data, such as batch stats. Passed to the function is has_aux is True.
-        devices (list): gpu/cpu devices to use
     returns: average loss over the entire layer
     """
     batches = get_batches(X, Y, batch_size, rand_key)
