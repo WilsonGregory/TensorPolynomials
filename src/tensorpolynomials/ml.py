@@ -1,9 +1,10 @@
 import time
 import math
+import functools
 
 import jax.numpy as jnp
 import jax.random as random
-from jaxtyping import Array
+from jaxtyping import Array, ArrayLike, PyTree
 import equinox as eqx
 
 import tensorpolynomials.utils as utils
@@ -115,7 +116,7 @@ class EpochStop(StopCondition):
 
         if (
             self.verbose == 2 or
-            (self.verbose == 1 and (current_epoch % (self.epochs // jnp.min([10,self.epochs])) == 0))
+            (self.verbose == 1 and (current_epoch % (self.epochs // min(10,self.epochs)) == 0))
         ):
             self.log_status(current_epoch, train_loss, val_loss, batch_time)
 
@@ -181,6 +182,32 @@ def make_step(map_and_loss, model, optim, opt_state, x, y):
     model = eqx.apply_updates(model, updates)
     return model, opt_state, loss_value
 
+def map_loss_in_batches(
+    map_and_loss,
+    model: PyTree,
+    X: ArrayLike,
+    Y: ArrayLike, 
+    batch_size: int,
+    rand_key: ArrayLike,
+):
+    """
+    Runs map_and_loss for the entire X, Y, splitting into batches if the data is larger than
+    the batch_size. This is helpful to run a whole validation/test set through map and loss when you need
+    to split those over batches for memory reasons.
+    args:
+        map_and_loss (function): function that takes in params, X_batch, Y_batch, rand_key, train, and 
+            aux_data if has_aux is true, and returns the loss, and aux_data if has_aux is true.
+        model (PyTree): the model that the data is run through
+        X (ArrayLike): input data
+        Y (ArrayLike): target output data
+        batch_size (int): effective batch_size, must be divisible by number of gpus
+        rand_key (jax.random.PRNGKey): rand key
+    returns: average loss over the entire layer
+    """
+    batches = get_batches(X, Y, batch_size, rand_key)
+    total_loss = functools.reduce(lambda carry, batch: carry + map_and_loss(model, *batch), batches, 0)
+    return total_loss / len(batches)
+
 def train(
     model, 
     map_and_loss, 
@@ -212,7 +239,7 @@ def train(
         save_params (str): if string, save params every 10 epochs, defaults to None
         devices (list): gpu/cpu devices to use, if None (default) then it will use jax.devices()
     """
-    opt_state = optim.init(model)
+    opt_state = optim.init(eqx.filter(model, eqx.is_array))
 
     epoch = 0
     epoch_val_loss = None
@@ -237,8 +264,10 @@ def train(
         train_loss.append(epoch_loss)
         epoch += 1
 
-        if (validation_X is not None) and (validation_Y is not None):
-            epoch_val_loss = map_and_loss(model, validation_X, validation_Y)
+        # We evaluate the validation loss in batches for memory reasons.
+        if (validation_X is not None and validation_Y is not None):
+            key, subkey = random.split(key)
+            epoch_val_loss = map_loss_in_batches(map_and_loss, model, validation_X, validation_Y, batch_size, subkey)
             val_loss.append(epoch_val_loss)
 
     return stop_condition.best_model, jnp.array(train_loss), jnp.array(val_loss)
