@@ -13,16 +13,19 @@ def sos_method(S):
     args:
         S (jnp.array): an (n,d) array, where n is the ambient dimension, d is number of vectors
     """
-    n,d = S.shape
+    n, d = S.shape
 
-    vmap_inner = jax.vmap(lambda ai: (jnp.linalg.norm(ai)**2 - d/n)*jnp.tensordot(ai,ai,axes=0))
-    A = jnp.sum(vmap_inner(S),axis=0)
-    assert A.shape == (d,d)
+    vmap_inner = jax.vmap(
+        lambda ai: (jnp.linalg.norm(ai) ** 2 - d / n) * jnp.tensordot(ai, ai, axes=0)
+    )
+    A = jnp.sum(vmap_inner(S), axis=0)
+    assert A.shape == (d, d)
 
-    _, eigvecs = jnp.linalg.eigh(A) # ascending order
-    assert eigvecs.shape == (d,d)
-    u = eigvecs[...,-1] # the eigenvector corresponding to the top eigenvalue
+    _, eigvecs = jnp.linalg.eigh(A)  # ascending order
+    assert eigvecs.shape == (d, d)
+    u = eigvecs[..., -1]  # the eigenvector corresponding to the top eigenvalue
     return S @ u
+
 
 def sos_methodII(S):
     """
@@ -31,16 +34,19 @@ def sos_methodII(S):
     args:
         S (jnp.array): an (N,n) array, where N is the ambient dimension and n is num of vectors
     """
-    N,n = S.shape
+    N, n = S.shape
 
-    vmap_inner = jax.vmap(lambda ai: (jnp.linalg.norm(ai)**2 - ((n-1)/N))*jnp.tensordot(ai,ai,axes=0))
-    A = jnp.sum(vmap_inner(S),axis=0) - 3*jnp.eye(n)
-    assert A.shape == (n,n)
+    vmap_inner = jax.vmap(
+        lambda ai: (jnp.linalg.norm(ai) ** 2 - ((n - 1) / N)) * jnp.tensordot(ai, ai, axes=0)
+    )
+    A = jnp.sum(vmap_inner(S), axis=0) - 3 * jnp.eye(n)
+    assert A.shape == (n, n)
 
-    _, eigvecs = jnp.linalg.eigh(A) # ascending order
-    assert eigvecs.shape == (n,n)
-    u = eigvecs[...,-1] # the eigenvector corresponding to the top eigenvalue
+    _, eigvecs = jnp.linalg.eigh(A)  # ascending order
+    assert eigvecs.shape == (n, n)
+    u = eigvecs[..., -1]  # the eigenvector corresponding to the top eigenvalue
     return S @ u
+
 
 class BaselineLearnedModel(eqx.Module):
     layers: list
@@ -56,7 +62,7 @@ class BaselineLearnedModel(eqx.Module):
             key (rand key): the random key
         """
         in_features = n * d
-        out_features = d + (d * (d-1) // 2) # output array needs to be symmetric
+        out_features = d + (d * (d - 1) // 2)  # output array needs to be symmetric
 
         key, subkey = random.split(key)
         self.layers = [eqx.nn.Linear(in_features, width, key=subkey)]
@@ -72,9 +78,9 @@ class BaselineLearnedModel(eqx.Module):
         args:
             S (jnp.array): (n,d) array, d vectors in R^n, but we treat them as n vectors in R^d
         """
-        n,d = S.shape
+        n, d = S.shape
         X = S.reshape(-1)
-        assert X.shape == (n*d,)
+        assert X.shape == (n * d,)
 
         for layer in self.layers[:-1]:
             X = jax.nn.relu(layer(X))
@@ -83,19 +89,20 @@ class BaselineLearnedModel(eqx.Module):
         upper_triangular = utils.fill_triangular(out, d)
         # subtract the diagonal because it will get added twice otherwise
         A = upper_triangular + upper_triangular.T - jnp.diag(upper_triangular)
-        assert A.shape == (d,d)
+        assert A.shape == (d, d)
 
-        _, eigvecs = jnp.linalg.eigh(A) # ascending order
-        assert eigvecs.shape == (d,d)
-        u = eigvecs[...,-1] # the eigenvector corresponding to the top eigenvalue
+        _, eigvecs = jnp.linalg.eigh(A)  # ascending order
+        assert eigvecs.shape == (d, d)
+        u = eigvecs[..., -1]  # the eigenvector corresponding to the top eigenvalue
         return S @ u
+
 
 class BaselineCNN(eqx.Module):
     conv_layers: list
     fc_layers: list
 
     def __init__(self, d, width, key):
-        out_features = d + (d * (d-1) // 2) # output array needs to be symmetric
+        out_features = d + (d * (d - 1) // 2)  # output array needs to be symmetric
         subkey1, subkey2, subkey3, subkey4 = random.split(key, 4)
 
         # self.layers = [
@@ -121,15 +128,15 @@ class BaselineCNN(eqx.Module):
         ]
 
         self.fc_layers = [
-            eqx.nn.Linear(width*4*4, 50, key=subkey3),
+            eqx.nn.Linear(width * 4 * 4, 50, key=subkey3),
             jax.nn.relu,
-            eqx.nn.Linear(50, out_features, key=subkey4)
+            eqx.nn.Linear(50, out_features, key=subkey4),
         ]
-        
+
     def __call__(self, S):
-        n,d = S.shape
+        n, d = S.shape
         assert n == (28**2)
-        x = S.T.reshape((d,28,28))
+        x = S.T.reshape((d, 28, 28))
 
         for layer in self.conv_layers:
             x = layer(x)
@@ -142,12 +149,13 @@ class BaselineCNN(eqx.Module):
         upper_triangular = utils.fill_triangular(x, d)
         # subtract the diagonal because it will get added twice otherwise
         A = upper_triangular + upper_triangular.T - jnp.diag(upper_triangular)
-        assert A.shape == (d,d)
+        assert A.shape == (d, d)
 
-        _, eigvecs = jnp.linalg.eigh(A) # ascending order
-        assert eigvecs.shape == (d,d)
-        u = eigvecs[...,-1] # the eigenvector corresponding to the top eigenvalue
+        _, eigvecs = jnp.linalg.eigh(A)  # ascending order
+        assert eigvecs.shape == (d, d)
+        u = eigvecs[..., -1]  # the eigenvector corresponding to the top eigenvalue
         return S @ u
+
 
 class SparseVectorHunterDiagonal(eqx.Module):
     layers: list
@@ -179,7 +187,7 @@ class SparseVectorHunterDiagonal(eqx.Module):
         args:
             S (jnp.array): (n,d) array, d vectors in R^n, but we treat them as n vectors in R^d
         """
-        n,d = S.shape
+        n, d = S.shape
         X = jnp.diag(S @ S.T).reshape(-1)
         assert X.shape == (n,)
 
@@ -189,15 +197,16 @@ class SparseVectorHunterDiagonal(eqx.Module):
         out = self.layers[-1](X)
 
         # (n,d) -> (n,d,d)
-        outer_prods = jax.vmap(lambda row: jnp.tensordot(row,row,axes=0))(S)
+        outer_prods = jax.vmap(lambda row: jnp.tensordot(row, row, axes=0))(S)
         basis = jnp.concatenate([outer_prods, jnp.eye(d)[None]])
-        assert basis.shape == (n+1,d,d)
-        A = jnp.sum(out.reshape((-1,1,1))*basis, axis=0) 
+        assert basis.shape == (n + 1, d, d)
+        A = jnp.sum(out.reshape((-1, 1, 1)) * basis, axis=0)
 
-        _, eigvecs = jnp.linalg.eigh(A) # ascending order
-        assert eigvecs.shape == (d,d)
-        u = eigvecs[...,-1] # the eigenvector corresponding to the top eigenvalue
+        _, eigvecs = jnp.linalg.eigh(A)  # ascending order
+        assert eigvecs.shape == (d, d)
+        u = eigvecs[..., -1]  # the eigenvector corresponding to the top eigenvalue
         return S @ u
+
 
 class SparseVectorHunter(eqx.Module):
     layers: list
@@ -211,8 +220,8 @@ class SparseVectorHunter(eqx.Module):
             num_hidden_layers (int): number of hidden layers, input/output of width
             key (rand key): the  random key
         """
-        in_features = n + (n*(n-1)//2)
-        out_features = n + 1 + (n*(n-1)//2)
+        in_features = n + (n * (n - 1) // 2)
+        out_features = n + 1 + (n * (n - 1) // 2)
 
         key, subkey = random.split(key)
         self.layers = [eqx.nn.Linear(in_features, width, key=subkey)]
@@ -228,9 +237,9 @@ class SparseVectorHunter(eqx.Module):
         args:
             S (jnp.array): (n,d) array, d vectors in R^n, but we treat them as n vectors in R^d
         """
-        n,d = S.shape
+        n, d = S.shape
         X = (S @ S.T)[jnp.triu_indices(n)].reshape(-1)
-        assert X.shape == (n + n*(n-1)//2,)
+        assert X.shape == (n + n * (n - 1) // 2,)
 
         for layer in self.layers[:-1]:
             X = jax.nn.relu(layer(X))
@@ -241,19 +250,22 @@ class SparseVectorHunter(eqx.Module):
         # a_i a_j with a_j a_i so that the basis is Hermitian
 
         # (d,n,n,d) -> (d,d,n,n) -> (d**2,n,n)
-        outer_prods = jnp.tensordot(S.T,S,axes=0).transpose((0,3,1,2)).reshape((d**2,n,n))
-        outer_prods = jax.vmap(lambda arr: arr[jnp.triu_indices(n)])(outer_prods).reshape((d,d,-1))
-        hermitian_prods = jnp.moveaxis(0.5*(outer_prods + outer_prods.transpose((1,0,2))), 2, 0)
+        outer_prods = jnp.tensordot(S.T, S, axes=0).transpose((0, 3, 1, 2)).reshape((d**2, n, n))
+        outer_prods = jax.vmap(lambda arr: arr[jnp.triu_indices(n)])(outer_prods).reshape(
+            (d, d, -1)
+        )
+        hermitian_prods = jnp.moveaxis(0.5 * (outer_prods + outer_prods.transpose((1, 0, 2))), 2, 0)
 
         basis = jnp.concatenate([hermitian_prods, jnp.eye(d)[None]])
-        assert basis.shape == (n + 1 + (n*(n-1)//2),d,d)
+        assert basis.shape == (n + 1 + (n * (n - 1) // 2), d, d)
 
-        A = jnp.sum(out.reshape((-1,1,1))*basis, axis=0)
+        A = jnp.sum(out.reshape((-1, 1, 1)) * basis, axis=0)
 
-        _, eigvecs = jnp.linalg.eigh(A) # ascending order
-        assert eigvecs.shape == (d,d)
-        u = eigvecs[...,-1] # the eigenvector corresponding to the top eigenvector
+        _, eigvecs = jnp.linalg.eigh(A)  # ascending order
+        assert eigvecs.shape == (d, d)
+        u = eigvecs[..., -1]  # the eigenvector corresponding to the top eigenvector
         return S @ u
+
 
 class SVHPerm(eqx.Module):
     layers: list
@@ -269,49 +281,54 @@ class SVHPerm(eqx.Module):
             num_hidden_layers (int): number of hidden layers, input/output of width
             key (rand key): the random key
         """
-        basis_sym_nonsym = utils.PermInvariantTensor.get(4,n,((0,1),))
-        basis_nonsym_nonsym = utils.PermInvariantTensor.get(4,n)
-        basis_nonsym_sym = basis_sym_nonsym.transpose((0,3,4,1,2))
-        bias_basis = utils.PermInvariantTensor.get(2,n)
+        basis_sym_nonsym = utils.PermInvariantTensor.get(4, n, ((0, 1),))
+        basis_nonsym_nonsym = utils.PermInvariantTensor.get(4, n)
+        basis_nonsym_sym = basis_sym_nonsym.transpose((0, 3, 4, 1, 2))
+        bias_basis = utils.PermInvariantTensor.get(2, n)
 
         key, subkey = random.split(key)
-        self.layers = [ml.GeneralLinear(basis_sym_nonsym,1,width,True,bias_basis,subkey)]
+        self.layers = [ml.GeneralLinear(basis_sym_nonsym, 1, width, True, bias_basis, subkey)]
         for _ in range(num_hidden_layers):
             key, subkey = random.split(key)
             self.layers.append(
-                ml.GeneralLinear(basis_nonsym_nonsym,width,width,True,bias_basis,key=subkey),
+                ml.GeneralLinear(basis_nonsym_nonsym, width, width, True, bias_basis, key=subkey),
             )
 
         key, subkey1, subkey2 = random.split(key, 3)
-        self.last_layer_pairs = ml.GeneralLinear(basis_nonsym_sym,width,1,True,bias_basis,subkey1)
-        self.last_layer_identity = ml.GeneralLinear(bias_basis,width,1,True,jnp.ones((1,1)),subkey2)
+        self.last_layer_pairs = ml.GeneralLinear(
+            basis_nonsym_sym, width, 1, True, bias_basis, subkey1
+        )
+        self.last_layer_identity = ml.GeneralLinear(
+            bias_basis, width, 1, True, jnp.ones((1, 1)), subkey2
+        )
 
     def __call__(self, S):
         """
         args:
             S (jnp.array): (n,d) array, d vectors in R^n, but we treat them as n vectors in R^d
         """
-        n,d = S.shape
+        n, d = S.shape
         X = (S @ S.T)[None]
-        assert X.shape == (1,n,n)
+        assert X.shape == (1, n, n)
 
         for layer in self.layers:
             X = jax.nn.leaky_relu(layer(X))
 
         pairs = self.last_layer_pairs(X)
-        assert pairs.shape == (1,n,n), f'{pairs.shape}'
+        assert pairs.shape == (1, n, n), f"{pairs.shape}"
         identity_scalar = self.last_layer_identity(X)
-        
+
         # Now get a basis consisting of outer products of all pairs of rows.
-        pairs_basis = jnp.einsum('ab,cd->acbd', S, S)
-        assert pairs_basis.shape == (n,n,d,d)
+        pairs_basis = jnp.einsum("ab,cd->acbd", S, S)
+        assert pairs_basis.shape == (n, n, d, d)
 
-        A = jnp.einsum('ab,abcd->cd', pairs[0], pairs_basis) + identity_scalar * jnp.eye(d)
+        A = jnp.einsum("ab,abcd->cd", pairs[0], pairs_basis) + identity_scalar * jnp.eye(d)
 
-        _, eigvecs = jnp.linalg.eigh(A) # ascending order
-        assert eigvecs.shape == (d,d)
-        u = eigvecs[...,-1] # the eigenvector corresponding to the top eigenvector
+        _, eigvecs = jnp.linalg.eigh(A)  # ascending order
+        assert eigvecs.shape == (d, d)
+        u = eigvecs[..., -1]  # the eigenvector corresponding to the top eigenvector
         return S @ u
+
 
 class Direct(eqx.Module):
     layers: list
@@ -326,8 +343,8 @@ class Direct(eqx.Module):
             num_hidden_layers (int): number of hidden layers, input/output of width
             key (rand key): the random key
         """
-        in_features = n + (n*(n-1)//2) # input is pairwise inner products
-        out_features = n # output is n scalars
+        in_features = n + (n * (n - 1) // 2)  # input is pairwise inner products
+        out_features = n  # output is n scalars
 
         key, subkey = random.split(key)
         self.layers = [eqx.nn.Linear(in_features, width, key=subkey)]
@@ -343,9 +360,9 @@ class Direct(eqx.Module):
         args:
             S (jnp.array): (n,d) array, d vectors in R^n, but we treat them as n vectors in R^d
         """
-        n,d = S.shape
+        n, d = S.shape
         X = (S @ S.T)[jnp.triu_indices(n)].reshape(-1)
-        assert X.shape == (n + n*(n-1)//2,)
+        assert X.shape == (n + n * (n - 1) // 2,)
 
         for layer in self.layers[:-1]:
             X = jax.nn.relu(layer(X))
@@ -353,6 +370,7 @@ class Direct(eqx.Module):
         out = self.layers[-1](X)
         assert out.shape == (n,)
         return out / jnp.linalg.norm(out)
+
 
 class DirectDiagonal(eqx.Module):
     layers: list
@@ -367,8 +385,8 @@ class DirectDiagonal(eqx.Module):
             num_hidden_layers (int): number of hidden layers, input/output of width
             key (rand key): the random key
         """
-        in_features = n # input is pairwise inner products
-        out_features = n # output is n scalars
+        in_features = n  # input is pairwise inner products
+        out_features = n  # output is n scalars
 
         key, subkey = random.split(key)
         self.layers = [eqx.nn.Linear(in_features, width, key=subkey)]
@@ -384,7 +402,7 @@ class DirectDiagonal(eqx.Module):
         args:
             S (jnp.array): (n,d) array, d vectors in R^n, but we treat them as n vectors in R^d
         """
-        n,d = S.shape
+        n, d = S.shape
         X = jnp.diag(S @ S.T).reshape(-1)
         assert X.shape == (n,)
 
