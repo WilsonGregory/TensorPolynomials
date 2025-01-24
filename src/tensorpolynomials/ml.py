@@ -90,14 +90,17 @@ class GeneralLinear(eqx.Module):
 
 
 def get_batches(X, y, batch_size, rand_key, devices):
+    devices = jax.devices() if devices is None else devices
+
     X_batches = []
     y_batches = []
     batch_indices = random.permutation(rand_key, len(X))
     # if total size is not divisible by batch, the remainder will be ignored
     for i in range(int(math.floor(len(X) / batch_size))):  # iterate through the batches of an epoch
         idxs = batch_indices[i * batch_size : (i + 1) * batch_size]
+        # shape to (num_gpus,batch/num_gpus,...)
         X_batches.append(X[idxs].reshape((len(devices), -1) + X[idxs].shape[1:]))
-        y_batches.append(y[idxs].reshape((len(devices), -1)))
+        y_batches.append(y[idxs].reshape((len(devices), -1) + y[idxs].shape[1:]))
 
     return X_batches, y_batches
 
@@ -227,7 +230,7 @@ def evaluate(
     return_map: bool = False,
 ) -> jax.Array:
     """
-    Runs map_and_loss for the entire layer_X, layer_Y, splitting into batches if the layer is larger than
+    Runs map_and_loss for the entire x, y, splitting into batches if the data is larger than
     the batch_size. This is helpful to run a whole validation/test set through map and loss when you need
     to split those over batches for memory reasons. Automatically pmaps over multiple gpus, so the number
     of gpus must evenly divide batch_size as well as as any remainder of the layer.
@@ -235,8 +238,8 @@ def evaluate(
         map_and_loss (function): function that takes in model, X_batch, Y_batch, and
             aux_data if has_aux is true, and returns the loss, and aux_data if has_aux is true.
         model (model PyTree): the model to run through map_and_loss
-        x (BatchLayer): input data
-        y (BatchLayer): target output data
+        x (array): input data
+        y (array): target output data
         sharding: sharding over multiple GPUs, if None (default), will use available devices
         has_aux (bool): has auxilliary data, such as batch_stats, defaults to False
         aux_data (any): auxilliary data, such as batch stats. Passed to the function is has_aux is True.
@@ -277,9 +280,9 @@ def aux_data_reducer(ls):
     return ls[-1]
 
 
-def layer_reducer(ls):
+def data_reducer(ls):
     """
-    If map data returns the mapped layers, merge them togther
+    If map data returns the mapped data, merge them togther
     """
     # TODO: fix this
     return functools.reduce(lambda carry, val: carry.concat(val), ls, ls[0].empty())
@@ -300,27 +303,27 @@ def map_loss_in_batches(
     return_map: bool = False,
 ) -> jax.Array:
     """
-    Runs map_and_loss for the entire layer_X, layer_Y, splitting into batches if the layer is larger than
+    Runs map_and_loss for the entire x,y, splitting into batches if the data is larger than
     the batch_size. This is helpful to run a whole validation/test set through map and loss when you need
     to split those over batches for memory reasons. Automatically pmaps over multiple gpus, so the number
-    of gpus must evenly divide batch_size as well as as any remainder of the layer.
+    of gpus must evenly divide batch_size as well as any remainder of the data.
     args:
         map_and_loss (function): function that takes in model, X_batch, Y_batch, and
             aux_data and returns the loss and aux_data
         model (model PyTree): the model to run through map_and_loss
-        x (BatchLayer): input data
-        y (BatchLayer): target output data
+        x (array): input data
+        y (array): target output data
         batch_size (int): effective batch_size, must be divisible by number of gpus
         rand_key (jax.random.PRNGKey): rand key
         devices (list of jax devices): the gpus that the code will run on
         aux_data (any): auxilliary data, such as batch stats. Passed to the function is has_aux is True.
-    returns: average loss over the entire layer
+    returns: average loss over the entire dataset
     """
     if reducers is None:
         # use the default reducer for loss
         reducers = [loss_reducer]
         if return_map:
-            reducers.append(layer_reducer)
+            reducers.append(data_reducer)
 
     X_batches, Y_batches = get_batches(x, y, batch_size, rand_key, devices)
     results = [[] for _ in range(len(reducers))]
@@ -359,8 +362,8 @@ def train_step(
         model (equinox model pytree): the model
         optim (optax optimizer):
         opt_state:
-        x (BatchLayer): input data
-        y (BatchLayer): target data
+        x (array): input data
+        y (array): target data
         aux_data (Any): auxilliary data for stateful layers
     returns: model, opt_state, loss_value
     """
@@ -414,8 +417,8 @@ def train(
     shards over the available gpus, so batch_size should be divisible by the number of gpus. If you only want
     to train on a single GPU, the script should be run with CUDA_VISIBLE_DEVICES=# for whatever gpu number.
     args:
-        X (BatchLayer): The X input data as a layer by k of (images, channels, (N,)*D, (D,)*k)
-        Y (BatchLayer): The Y target data as a layer by k of (images, channels, (N,)*D, (D,)*k)
+        X (array): The X input data
+        Y (array): The Y target data
         map_and_loss (function): function that takes in model, X_batch, Y_batch, and aux_data and
             returns the loss and aux_data.
         model: Model pytree
@@ -424,9 +427,9 @@ def train(
             at a time
         batch_size (int): the size of each mini-batch in SGD
         optimizer (optax optimizer): optimizer
-        validation_X (BatchLayer): input data for a validation data set as a layer by k
+        validation_X (array): input data for a validation data set as a layer by k
             of (images, channels, (N,)*D, (D,)*k)
-        validation_Y (BatchLayer): target data for a validation data set as a layer by k
+        validation_Y (array): target data for a validation data set as a layer by k
             of (images, channels, (N,)*D, (D,)*k)
         save_model (str): if string, save model every 10 epochs, defaults to None
         aux_data (eqx.nn.State): initial aux data passed in to map_and_loss when has_aux is true.

@@ -3,7 +3,7 @@ import functools
 import numpy as np
 from mnist import MNIST
 import matplotlib.pyplot as plt
-from typing import Optional
+from typing import Any, Optional
 
 import jax
 import jax.numpy as jnp
@@ -16,23 +16,25 @@ import tensorpolynomials.data as tpoly_data
 import tensorpolynomials.models as models
 import tensorpolynomials.ml as ml
 
+
 def labels_only(data_labels: ArrayLike, labels: ArrayLike) -> jax.Array:
     """
     For array of data_labels, include that row if the label is in labels.
     """
     return functools.reduce(
-        lambda carry, label: carry | (data_labels == label), 
-        labels, 
+        lambda carry, label: carry | (data_labels == label),
+        labels,
         jnp.full_like(data_labels, False, dtype=bool),
     )
 
+
 def load_mnist(
-    dir: str, 
-    key: ArrayLike, 
-    labels: ArrayLike, 
-    train_size: int, 
-    val_size: int, 
-    test_size: int, 
+    dir: str,
+    key: ArrayLike,
+    labels: ArrayLike,
+    train_size: int,
+    val_size: int,
+    test_size: int,
     normalize_length: bool = True,
 ) -> tuple[jax.Array]:
     """
@@ -66,19 +68,20 @@ def load_mnist(
     val_images = train_images[sigma][:val_size]
     val_labels = train_labels[sigma][:val_size]
 
-    train_images = train_images[sigma][val_size:train_size + val_size]
-    train_labels = train_labels[sigma][val_size:train_size + val_size]
+    train_images = train_images[sigma][val_size : train_size + val_size]
+    train_labels = train_labels[sigma][val_size : train_size + val_size]
 
     test_images = test_images[sigma2][:test_size]
     test_labels = test_labels[sigma2][:test_size]
 
     return train_images, train_labels, val_images, val_labels, test_images, test_labels
 
+
 def normalize_and_noise(
-    data: ArrayLike, 
-    key: ArrayLike, 
-    d: int, 
-    noise_type: str = 'choice256_rotate', 
+    data: ArrayLike,
+    key: ArrayLike,
+    d: int,
+    noise_type: str = "choice256_rotate",
     noise_var: Optional[float] = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """
@@ -89,48 +92,59 @@ def normalize_and_noise(
 
     normalized_data = data / jnp.linalg.norm(data, axis=1, keepdims=True)
 
-    if noise_type == 'choice256_rotate':
-        noise = random.choice(subkey1, 256, shape=(num_points,img_size,d-1)) # this could be adapted
-        aug_data = jnp.concatenate([normalized_data[...,None], noise], axis=-1) # (b,pixels,views)
-    elif noise_type == 'normal_rotate': # columns of normal data, then right multiply by orthogonal matrix
-        noise = random.normal(subkey1, shape=(num_points,img_size,d-1))
-        aug_data = jnp.concatenate([normalized_data[...,None], noise], axis=-1) # (b,pixels,views)
-    elif noise_type == 'normal': # original image plus gaussian noise, d times
+    if noise_type == "choice256_rotate":
+        noise = random.choice(
+            subkey1, 256, shape=(num_points, img_size, d - 1)
+        )  # this could be adapted
+        aug_data = jnp.concatenate([normalized_data[..., None], noise], axis=-1)  # (b,pixels,views)
+    elif (
+        noise_type == "normal_rotate"
+    ):  # columns of normal data, then right multiply by orthogonal matrix
+        noise = random.normal(subkey1, shape=(num_points, img_size, d - 1))
+        aug_data = jnp.concatenate([normalized_data[..., None], noise], axis=-1)  # (b,pixels,views)
+    elif noise_type == "normal":  # original image plus gaussian noise, d times
         noise_var = 0.01 if noise_var is None else noise_var
-        noise = noise_var*random.normal(subkey1, shape=(num_points,img_size,d))
-        aug_data = normalized_data[...,None] + noise
-    elif noise_type == 'mask': # mask a certain percent of pixels with random values 0-255
+        noise = noise_var * random.normal(subkey1, shape=(num_points, img_size, d))
+        aug_data = normalized_data[..., None] + noise
+    elif noise_type == "mask":  # mask a certain percent of pixels with random values 0-255
         # for this one, use the raw (unormalized) image data
-        noise_var = 0.1 if noise_var is None else noise_var # percent of changed pixels
-        mask = random.choice(subkey1, 256, shape=(num_points,img_size,d))
-        idxs = random.bernoulli(subkey2, noise_var, shape=(num_points,img_size,d))
-        aug_data = jnp.where(idxs, mask, data[...,None])
-    elif noise_type == 'block':
-        sidelen = 28 # currently hardcoded
-        noise_var = 8 if noise_var is None else noise_var # sidelength of block
+        noise_var = 0.1 if noise_var is None else noise_var  # percent of changed pixels
+        mask = random.choice(subkey1, 256, shape=(num_points, img_size, d))
+        idxs = random.bernoulli(subkey2, noise_var, shape=(num_points, img_size, d))
+        aug_data = jnp.where(idxs, mask, data[..., None])
+    elif noise_type == "block":
+        sidelen = 28  # currently hardcoded
+        noise_var = 8 if noise_var is None else noise_var  # sidelength of block
 
-        zed = jnp.stack(jnp.meshgrid(jnp.arange(sidelen),jnp.arange(sidelen), indexing='ij'), axis=-1).reshape((-1,2)) #(28**2,2)
+        zed = jnp.stack(
+            jnp.meshgrid(jnp.arange(sidelen), jnp.arange(sidelen), indexing="ij"), axis=-1
+        ).reshape(
+            (-1, 2)
+        )  # (28**2,2)
 
-        block_vals = random.choice(subkey1, 256, shape=(len(data),d))
+        block_vals = random.choice(subkey1, 256, shape=(len(data), d))
         aug_data = np.zeros(data.shape + (d,))
-        for i, img in enumerate(data): # ugh, for loops
+        for i, img in enumerate(data):  # ugh, for loops
             assert img.shape == (28**2,)
             for j in range(d):
                 key, subkey = random.split(key)
-                idx_x, idx_y = random.choice(subkey, sidelen - noise_var, shape=(2,)) # an x and y coordinate
-                valid_x = (zed[:,0] >= idx_x ) & (zed[:,0] < (idx_x + noise_var))
-                valid_y = (zed[:,1] >= idx_y ) & (zed[:,1] < (idx_y + noise_var))
+                idx_x, idx_y = random.choice(
+                    subkey, sidelen - noise_var, shape=(2,)
+                )  # an x and y coordinate
+                valid_x = (zed[:, 0] >= idx_x) & (zed[:, 0] < (idx_x + noise_var))
+                valid_y = (zed[:, 1] >= idx_y) & (zed[:, 1] < (idx_y + noise_var))
 
-                aug_data[i,:,j] = jnp.where(valid_x & valid_y, block_vals[i,j], img)
+                aug_data[i, :, j] = jnp.where(valid_x & valid_y, block_vals[i, j], img)
 
         aug_data = jnp.array(aug_data)
 
     aug_data = aug_data / jnp.linalg.norm(aug_data, axis=1, keepdims=True)
-    aug_data_orthogonal = tpoly_data.get_orthogonal_basis(subkey3, aug_data) 
+    aug_data_orthogonal = tpoly_data.get_orthogonal_basis(subkey3, aug_data)
 
-    return aug_data_orthogonal, normalized_data, aug_data # (batch,n,d)
+    return aug_data_orthogonal, normalized_data, aug_data  # (batch,n,d)
 
-def map_and_loss(model: PyTree, x: ArrayLike, y: ArrayLike) -> float:
+
+def map_and_loss(model: PyTree, x: ArrayLike, y: ArrayLike, aux_data: Any) -> tuple[float, Any]:
     """
     Map x using the model,
     args:
@@ -139,11 +153,12 @@ def map_and_loss(model: PyTree, x: ArrayLike, y: ArrayLike) -> float:
         y (jnp.array): output data, the sparse vector, shape (batch,n)
     """
     pred_y = jax.vmap(model)(x)
-    squared_dots = jnp.einsum('...i,...i->...', y, pred_y)**2
-    return 1 - jnp.mean(squared_dots)
+    squared_dots = jnp.einsum("...i,...i->...", y, pred_y) ** 2
+    return 1 - jnp.mean(squared_dots), aux_data
 
-dir = '/data/wgregor4/mnist'
-n = 28 ** 2
+
+dir = "/data/wgregor4/mnist"
+n = 28**2
 d = 20
 width = 128
 depth = 2
@@ -155,7 +170,7 @@ labels = jnp.arange(10)
 train = True
 save = False
 load_results = False
-save_dir = '../runs/sparse_vector/'
+save_dir = "../runs/sparse_vector/"
 trials = 1
 verbose = 0
 # print_noise_types = '../images/mnist_outliers/noise_types.png'
@@ -167,13 +182,13 @@ table_print = True
 key = random.PRNGKey(time.time_ns())
 key, subkey = random.split(key)
 train_sparse, train_labels, val_sparse, val_labels, test_sparse, test_labels = load_mnist(
-    dir, 
-    subkey, 
-    labels, 
-    train_size, 
-    val_size, 
+    dir,
+    subkey,
+    labels,
+    train_size,
+    val_size,
     test_size,
-    normalize_length=False, # do this later in noise
+    normalize_length=False,  # do this later in noise
 )
 
 train_size = len(train_sparse)
@@ -182,48 +197,67 @@ batch_size = 10
 key, subkey1, subkey2, subkey3, subkey4 = random.split(key, 5)
 models_list = [
     # ('baselineCNN', 'CNN', 1e-3, models.BaselineCNN(d,width,subkey4)),
-    ('baselineLearned', 'MLP', 1e-3, models.BaselineLearnedModel(n, d, width, depth, subkey3)), # n*d inputs, d*d outputs
-    ('sparseDiagonal', 'SVH-Diag', 5e-4, models.SparseVectorHunterDiagonal(n, width, depth, subkey2)), # n inputs, n+1 outputs
-    ('sparse', 'SVH', 3e-4, models.SparseVectorHunter(n, width, depth, subkey3)), # n+(n(n-1)/2) inputs, n+1+(n(n-1)/2) outputs
+    (
+        "baselineLearned",
+        "MLP",
+        1e-3,
+        models.BaselineLearnedModel(n, d, width, depth, subkey3),
+    ),  # n*d inputs, d*d outputs
+    (
+        "sparseDiagonal",
+        "SVH-Diag",
+        5e-4,
+        models.SparseVectorHunterDiagonal(n, width, depth, subkey2),
+    ),  # n inputs, n+1 outputs
+    (
+        "sparse",
+        "SVH",
+        3e-4,
+        models.SparseVectorHunter(n, width, depth, subkey3),
+    ),  # n+(n(n-1)/2) inputs, n+1+(n(n-1)/2) outputs
 ]
 
 noise_types = [
-    ('normal_rotate', 'Subspace', None), 
-    ('normal', 'Gaussian', 0.05), 
-    ('mask', 'Bernoulli', 0.3), 
-    ('block', 'Block', 12),
+    ("normal_rotate", "Subspace", None),
+    ("normal", "Gaussian", 0.05),
+    ("mask", "Bernoulli", 0.3),
+    ("block", "Block", 12),
 ]
 for model_name, _, lr, model in models_list:
-    print(f'{model_name}: {sum([x.size for x in jax.tree_util.tree_leaves(eqx.filter(model,eqx.is_array))]):,} params')
+    print(
+        f"{model_name}: {sum([x.size for x in jax.tree_util.tree_leaves(eqx.filter(model,eqx.is_array))]):,} params"
+    )
 
-results = np.zeros((trials,len(noise_types),len(models_list)+2,2))
+results = np.zeros((trials, len(noise_types), len(models_list) + 2, 2))
 
-plt.rcParams['axes.titlesize'] = 40
+plt.rcParams["axes.titlesize"] = 40
 if print_noise_types is not None:
-    ncols = 1 + min(d,3) + min(d,3)
-    fig, axes = plt.subplots(len(noise_types),ncols,figsize=(8*ncols,8*len(noise_types)))
+    ncols = 1 + min(d, 3) + min(d, 3)
+    fig, axes = plt.subplots(len(noise_types), ncols, figsize=(8 * ncols, 8 * len(noise_types)))
     for i, (noise_type, noise_name, noise_var) in enumerate(noise_types):
-        test_X, test_Y, nonortho_test_X = normalize_and_noise(test_sparse, subkey1, d, noise_type, noise_var)
+        test_X, test_Y, nonortho_test_X = normalize_and_noise(
+            test_sparse, subkey1, d, noise_type, noise_var
+        )
 
-        axes[i,0].imshow(test_Y[0].reshape((28,28)), cmap='gray')
-        axes[i,0].get_xaxis().set_ticks([])
-        axes[i,0].get_yaxis().set_ticks([])
+        axes[i, 0].imshow(test_Y[0].reshape((28, 28)), cmap="gray")
+        axes[i, 0].get_xaxis().set_ticks([])
+        axes[i, 0].get_yaxis().set_ticks([])
         # axes[i,0].set_title('Target Image')
-        axes[i,0].set_aspect('equal')
+        axes[i, 0].set_aspect("equal")
 
-        for j in range(1,1+min(d,3)):
-            axes[i,j].imshow(nonortho_test_X[0,:,j-1].reshape((28,28)), cmap='gray')
-            axes[i,j].get_xaxis().set_ticks([])
-            axes[i,j].get_yaxis().set_ticks([])
+        for j in range(1, 1 + min(d, 3)):
+            axes[i, j].imshow(nonortho_test_X[0, :, j - 1].reshape((28, 28)), cmap="gray")
+            axes[i, j].get_xaxis().set_ticks([])
+            axes[i, j].get_yaxis().set_ticks([])
             # axes[i,j].set_title(f'Raw {noise_name} {j}')
-            axes[i,j].set_aspect('equal')
+            axes[i, j].set_aspect("equal")
 
-        for j in range(1+min(d,3),1+min(d,3)+min(d,3)):
-            axes[i,j].imshow(test_X[0,:,j-(1+min(d,3))].reshape((28,28)), cmap='gray')
-            axes[i,j].get_xaxis().set_ticks([])
-            axes[i,j].get_yaxis().set_ticks([])
+        for j in range(1 + min(d, 3), 1 + min(d, 3) + min(d, 3)):
+            axes[i, j].imshow(test_X[0, :, j - (1 + min(d, 3))].reshape((28, 28)), cmap="gray")
+            axes[i, j].get_xaxis().set_ticks([])
+            axes[i, j].get_yaxis().set_ticks([])
             # axes[i,j].set_title(f'Basis {noise_name} {j-min(d,3)}')
-            axes[i,j].set_aspect('equal')
+            axes[i, j].set_aspect("equal")
 
     plt.tight_layout()
     fig.subplots_adjust(wspace=0.1, hspace=0.1)
@@ -232,103 +266,119 @@ if print_noise_types is not None:
 
 if print_sample_result is not None:
     ncols = 1 + 2 + len(models_list)
-    fig, axes = plt.subplots(len(noise_types),ncols,figsize=(8*ncols,8*len(noise_types)))
+    fig, axes = plt.subplots(len(noise_types), ncols, figsize=(8 * ncols, 8 * len(noise_types)))
 
 if load_results:
-    results = jnp.load(f'{save_dir}/sparse_vector_mnist_results_t{trials}_N{train_size}_n{n}_d{d}.npy')
+    results = jnp.load(
+        f"{save_dir}/sparse_vector_mnist_results_t{trials}_N{train_size}_n{n}_d{d}.npy"
+    )
 else:
     for t in range(trials):
         for i, (noise_type, noise_name, noise_var) in enumerate(noise_types):
             key, subkey1, subkey2, subkey3 = random.split(key, 4)
-            train_X, train_Y, _ = normalize_and_noise(train_sparse, subkey1, d, noise_type, noise_var)
+            train_X, train_Y, _ = normalize_and_noise(
+                train_sparse, subkey1, d, noise_type, noise_var
+            )
             val_X, val_Y, _ = normalize_and_noise(val_sparse, subkey2, d, noise_type, noise_var)
-            test_X, test_Y, noisy_test_X = normalize_and_noise(test_sparse, subkey3, d, noise_type, noise_var)
+            test_X, test_Y, noisy_test_X = normalize_and_noise(
+                test_sparse, subkey3, d, noise_type, noise_var
+            )
 
-            results[t,i,0,0] = 1 - map_and_loss(models.sos_method, train_X, train_Y)
-            results[t,i,0,1] = 1 - map_and_loss(models.sos_method, test_X, test_Y)
+            results[t, i, 0, 0] = 1 - map_and_loss(models.sos_method, train_X, train_Y, None)[0]
+            results[t, i, 0, 1] = 1 - map_and_loss(models.sos_method, test_X, test_Y, None)[0]
             start_time = time.time()
-            results[t,i,0,1] = 1 - map_and_loss(models.sos_method, test_X, test_Y)
+            results[t, i, 0, 1] = 1 - map_and_loss(models.sos_method, test_X, test_Y, None)[0]
             elapsed = time.time() - start_time
-            print(f'{t},{noise_type},sos: {results[t,i,0,1]}, time:{elapsed}')
+            print(f"{t},{noise_type},sos: {results[t,i,0,1]}, time:{elapsed}")
 
-            results[t,i,1,0] = 1 - map_and_loss(models.sos_methodII, train_X, train_Y)
-            results[t,i,1,1] = 1 - map_and_loss(models.sos_methodII, test_X, test_Y)
+            results[t, i, 1, 0] = 1 - map_and_loss(models.sos_methodII, train_X, train_Y, None)[0]
+            results[t, i, 1, 1] = 1 - map_and_loss(models.sos_methodII, test_X, test_Y, None)[0]
             start_time = time.time()
-            results[t,i,1,1] = 1 - map_and_loss(models.sos_methodII, test_X, test_Y)
+            results[t, i, 1, 1] = 1 - map_and_loss(models.sos_methodII, test_X, test_Y, None)[0]
             elapsed = time.time() - start_time
-            print(f'{t},{noise_type},sosII: {results[t,i,1,1]}, time:{elapsed}')
+            print(f"{t},{noise_type},sosII: {results[t,i,1,1]}, time:{elapsed}")
 
-            if (t==0) and (print_sample_result is not None):
-                axes[i,0].imshow(test_Y[0].reshape((28,28)), cmap='gray')
-                axes[i,0].get_xaxis().set_ticks([])
-                axes[i,0].get_yaxis().set_ticks([])
+            if (t == 0) and (print_sample_result is not None):
+                axes[i, 0].imshow(test_Y[0].reshape((28, 28)), cmap="gray")
+                axes[i, 0].get_xaxis().set_ticks([])
+                axes[i, 0].get_yaxis().set_ticks([])
                 # axes[i,0].set_title('Target Image')
-                axes[i,0].set_aspect('equal')
+                axes[i, 0].set_aspect("equal")
 
-                axes[i,1].imshow(models.sos_method(test_X[0]).reshape((28,28)), cmap='gray')
-                axes[i,1].get_xaxis().set_ticks([])
-                axes[i,1].get_yaxis().set_ticks([])
+                axes[i, 1].imshow(models.sos_method(test_X[0]).reshape((28, 28)), cmap="gray")
+                axes[i, 1].get_xaxis().set_ticks([])
+                axes[i, 1].get_yaxis().set_ticks([])
                 # axes[i,1].set_title(f'{noise_name}, SoS I')
-                axes[i,1].set_aspect('equal')
+                axes[i, 1].set_aspect("equal")
 
-                axes[i,1+1].imshow(models.sos_methodII(test_X[0]).reshape((28,28)), cmap='gray')
-                axes[i,1+1].get_xaxis().set_ticks([])
-                axes[i,1+1].get_yaxis().set_ticks([])
+                axes[i, 1 + 1].imshow(models.sos_methodII(test_X[0]).reshape((28, 28)), cmap="gray")
+                axes[i, 1 + 1].get_xaxis().set_ticks([])
+                axes[i, 1 + 1].get_yaxis().set_ticks([])
                 # axes[i,1+1].set_title(f'{noise_name}, SoS II')
-                axes[i,1+1].set_aspect('equal')
+                axes[i, 1 + 1].set_aspect("equal")
 
             for k, (model_name, print_name, lr, model) in enumerate(models_list):
 
                 if train:
-                    steps_per_epoch = int(train_size/batch_size)
+                    steps_per_epoch = int(train_size / batch_size)
                     key, subkey = random.split(key)
-                    trained_model, _, _ = ml.train(
-                        model, 
-                        map_and_loss, 
-                        train_X, 
-                        train_Y, 
-                        subkey, 
+                    trained_model, _, _, _ = ml.train(
+                        train_X,
+                        train_Y,
+                        map_and_loss,
+                        model,
+                        subkey,
                         ml.EpochStop(epochs=30, verbose=verbose),
-                        optax.adam(optax.exponential_decay(lr, int(train_size/batch_size), 0.999)), 
                         batch_size,
+                        optax.adam(
+                            optax.exponential_decay(lr, int(train_size / batch_size), 0.999)
+                        ),
                         val_X,
                         val_Y,
                     )
                     if save:
                         eqx.tree_serialise_leaves(
-                            f'{save_dir}{model_name}_t{t}_{noise_type}{noise_var}_N{train_size}_d{d}.eqx',
+                            f"{save_dir}{model_name}_t{t}_{noise_type}{noise_var}_N{train_size}_d{d}.eqx",
                             trained_model,
                         )
                 else:
                     trained_model = eqx.tree_deserialise_leaves(
-                        f'{save_dir}{model_name}_t{t}_{noise_type}{noise_var}_N{train_size}_d{d}.eqx',
+                        f"{save_dir}{model_name}_t{t}_{noise_type}{noise_var}_N{train_size}_d{d}.eqx",
                         model,
                     )
 
                 key, subkey1, subkey2 = random.split(key, 3)
-                results[t,i,k+2,0] = 1 - ml.map_loss_in_batches(map_and_loss, trained_model, train_X, train_Y, batch_size, subkey1)
-                results[t,i,k+2,1] = 1 - ml.map_loss_in_batches(map_and_loss, trained_model, test_X, test_Y, batch_size, subkey2)
+                results[t, i, k + 2, 0] = 1 - ml.map_loss_in_batches(
+                    map_and_loss, trained_model, train_X, train_Y, batch_size, subkey1
+                )
+                results[t, i, k + 2, 1] = 1 - ml.map_loss_in_batches(
+                    map_and_loss, trained_model, test_X, test_Y, batch_size, subkey2
+                )
                 start_time = time.time()
-                results[t,i,k+2,1] = 1 - ml.map_loss_in_batches(map_and_loss, trained_model, test_X, test_Y, batch_size, subkey2)
+                results[t, i, k + 2, 1] = 1 - ml.map_loss_in_batches(
+                    map_and_loss, trained_model, test_X, test_Y, batch_size, subkey2
+                )
                 elapsed = time.time() - start_time
 
-                print(f'{t},{noise_type},{model_name}: {results[t,i,k+2,1]}, time_ns:{elapsed}')
+                print(f"{t},{noise_type},{model_name}: {results[t,i,k+2,1]}, time_ns:{elapsed}")
 
-                if (t==0) and (print_sample_result is not None):
-                    axes[i,1+2+k].imshow(trained_model(test_X[0]).reshape((28,28)), cmap='gray')
-                    axes[i,1+2+k].get_xaxis().set_ticks([])
-                    axes[i,1+2+k].get_yaxis().set_ticks([])
+                if (t == 0) and (print_sample_result is not None):
+                    axes[i, 1 + 2 + k].imshow(
+                        trained_model(test_X[0]).reshape((28, 28)), cmap="gray"
+                    )
+                    axes[i, 1 + 2 + k].get_xaxis().set_ticks([])
+                    axes[i, 1 + 2 + k].get_yaxis().set_ticks([])
                     # axes[i,1+2+k].set_title(f'{noise_name}, {print_name}')
-                    axes[i,1+2+k].set_aspect('equal')
+                    axes[i, 1 + 2 + k].set_aspect("equal")
 
-        if (t==0) and (print_sample_result is not None):
+        if (t == 0) and (print_sample_result is not None):
             plt.tight_layout()
             fig.subplots_adjust(wspace=0.1, hspace=0.1)
             plt.savefig(print_sample_result)
             plt.close()
 
     jnp.save(
-        f'{save_dir}/sparse_vector_mnist_results_t{trials}_N{train_size}_n{n}_d{d}.npy',
+        f"{save_dir}/sparse_vector_mnist_results_t{trials}_N{train_size}_n{n}_d{d}.npy",
         results,
     )
 
@@ -336,34 +386,37 @@ else:
 mean_results = jnp.mean(results, axis=0)
 std_results = jnp.std(results, axis=0)
 
-print_models = [('sos', models.sos_method), ('sosII', models.sos_methodII)] + models_list
+print_models = [("sos", models.sos_method), ("sosII", models.sos_methodII)] + models_list
 if table_print:
     mean_results = jnp.around(mean_results, 3)
     std_results = jnp.around(std_results, 3)
 
-    for l in [0,1]: # train is 0, test is 1
+    for l in [0, 1]:  # train is 0, test is 1
         if l == 0:
-            print('Train')
+            print("Train")
         else:
-            print('Test')
+            print("Test")
 
-        print('\\hline')
+        print("\\hline")
         for i, (noise_type, noise_name, noise_var) in enumerate(noise_types):
 
-            print(f'{noise_name} ', end='')
+            print(f"{noise_name} ", end="")
 
             for k in range(len(print_models)):
-                if jnp.allclose(mean_results[i,k,l], jnp.max(mean_results[i,:,l])):
-                    print(f'& \\textbf{"{"}{mean_results[i,k,l]:.3f} $\\pm$ {std_results[i,k,l]:.3f}{"}"} ', end='')
+                if jnp.allclose(mean_results[i, k, l], jnp.max(mean_results[i, :, l])):
+                    print(
+                        f'& \\textbf{"{"}{mean_results[i,k,l]:.3f} $\\pm$ {std_results[i,k,l]:.3f}{"}"} ',
+                        end="",
+                    )
                 else:
-                    print(f'& {mean_results[i,k,l]:.3f} $\\pm$ {std_results[i,k,l]:.3f} ', end='')
+                    print(f"& {mean_results[i,k,l]:.3f} $\\pm$ {std_results[i,k,l]:.3f} ", end="")
 
-            print('\\\\')
-            print('\\hline')
-        
-        print('\n')
+            print("\\\\")
+            print("\\hline")
+
+        print("\n")
 else:
     for i, (noise_type, noise_name, noise_var) in enumerate(noise_types):
-        print(f'noise_type: {noise_type}')
+        print(f"noise_type: {noise_type}")
         print(mean_results[i])
-        print(f'+ {std_results[i]}')
+        print(f"+ {std_results[i]}")

@@ -23,7 +23,7 @@ sampling_print_names = {
 }
 
 
-def map_and_loss(model, x, y):
+def map_and_loss(model, x, y, aux_data):
     """
     Map x using the model,
     args:
@@ -33,7 +33,7 @@ def map_and_loss(model, x, y):
     """
     pred_y = jax.vmap(model)(x)
     squared_dots = jnp.einsum("...i,...i->...", y, pred_y) ** 2
-    return 1 - jnp.mean(squared_dots)
+    return 1 - jnp.mean(squared_dots), aux_data
 
 
 # Main
@@ -56,7 +56,7 @@ test_size = 500
 width = 128
 depth = 2
 batch_size = 100
-trials = 5
+trials = 1
 verbose = 0
 
 key, subkey1, subkey2, subkey3, subkey4, subkey5 = random.split(key, 6)
@@ -123,34 +123,46 @@ if train:
                     subkey3, n, d, eps, test_size, v0_sampling, cov
                 )
 
-                results[t, i, j, 0, 0] = 1 - map_and_loss(models.sos_method, train_W, train_v0)
-                results[t, i, j, 0, 1] = 1 - map_and_loss(models.sos_method, test_W, test_v0)
+                results[t, i, j, 0, 0] = (
+                    1 - map_and_loss(models.sos_method, train_W, train_v0, None)[0]
+                )
+                results[t, i, j, 0, 1] = (
+                    1 - map_and_loss(models.sos_method, test_W, test_v0, None)[0]
+                )
                 print(f"{t},{v0_sampling},{cov_type},sos: {results[t,i,j,0,1]}")
 
-                results[t, i, j, 1, 0] = 1 - map_and_loss(models.sos_methodII, train_W, train_v0)
-                results[t, i, j, 1, 1] = 1 - map_and_loss(models.sos_methodII, test_W, test_v0)
+                results[t, i, j, 1, 0] = (
+                    1 - map_and_loss(models.sos_methodII, train_W, train_v0, None)[0]
+                )
+                results[t, i, j, 1, 1] = (
+                    1 - map_and_loss(models.sos_methodII, test_W, test_v0, None)[0]
+                )
                 print(f"{t},{v0_sampling},{cov_type},sosII: {results[t,i,j,1,1]}")
 
                 for k, (model_name, lr, model) in enumerate(models_list):
                     steps_per_epoch = int(train_size / batch_size)
                     key, subkey = random.split(key)
-                    trained_model, _, _ = ml.train(
-                        model,
-                        map_and_loss,
+                    trained_model, _, _, _ = ml.train(
                         train_W,
                         train_v0,
+                        map_and_loss,
+                        model,
                         subkey,
                         ml.ValLoss(patience=20, verbose=verbose),
+                        batch_size,
                         optax.adam(
                             optax.exponential_decay(lr, int(train_size / batch_size), 0.999)
                         ),
-                        batch_size,
                         val_W,
                         val_v0,
                     )
 
-                    results[t, i, j, k + 2, 0] = 1 - map_and_loss(trained_model, train_W, train_v0)
-                    results[t, i, j, k + 2, 1] = 1 - map_and_loss(trained_model, test_W, test_v0)
+                    results[t, i, j, k + 2, 0] = (
+                        1 - map_and_loss(trained_model, train_W, train_v0, None)[0]
+                    )
+                    results[t, i, j, k + 2, 1] = (
+                        1 - map_and_loss(trained_model, test_W, test_v0, None)[0]
+                    )
                     print(f"{t},{v0_sampling},{cov_type},{model_name}: {results[t,i,j,k+2,1]}")
 
                 if save:
