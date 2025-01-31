@@ -108,8 +108,7 @@ class SVHTwoTensor(eqx.Module):
         args:
             x (jnp.array): (d,d) array,
         """
-        # symmetrize_input=True seems to cause issues with autograd, and x is assumed symmetric
-        eigvals, eigvecs = jnp.linalg.eigh(x, symmetrize_input=False)
+        eigvals, eigvecs = jnp.linalg.eigh(x)
         # construct (d,d+1) where the ith row is [lambda_1, lambda_2, lambda_3, lambda_i]
         extended_eigvals = jnp.concatenate(
             [jnp.full((3, 3), eigvals), eigvals.reshape((3, 1))], axis=1
@@ -144,8 +143,7 @@ class SVHTwoTensorPermEquivariant(eqx.Module):
         args:
             x (jnp.array): (d,d) array,
         """
-        # symmetrize_input=True seems to cause issues with autograd, and x is assumed symmetric
-        eigvals, eigvecs = jnp.linalg.eigh(x, symmetrize_input=True)
+        eigvals, eigvecs = jnp.linalg.eigh(x)
         evals_dict = {1: eigvals[None]}  # (1,D)
         for layer in self.equiv_layers[:-1]:
             evals_dict = {k: jax.nn.relu(tensor) for k, tensor in layer(evals_dict).items()}
@@ -230,7 +228,6 @@ if train:
                 model,
                 subkey,
                 ml.EpochStop(epochs=20, verbose=verbose),
-                # ml.ValLoss(patience=20, verbose=verbose),
                 batch_size,
                 optax.adam(optax.exponential_decay(lr, int(n_train / batch_size), 0.995)),
             )
@@ -239,15 +236,5 @@ if train:
             results[t, k, 1] = map_and_loss(trained_model, test_X, test_y, None)[0]
             print(f"{t},{model_name}: {results[t,k,1]}")
 
-            # Test that the model is equivariant
-            # for _ in range(10):
-            #     key, subkey = random.split(key)
-            #     O = random.orthogonal(key, D)
-            #     print(
-            #         jnp.max(
-            #             jnp.abs(
-            #                 trained_model(utils.times_group_element(test_X[0], O))
-            #                 - utils.times_group_element(trained_model(test_X[0]), O)
-            #             )
-            #         )
-            #     )
+print(results)
+print("mean over trials", jnp.mean(results, axis=0))
