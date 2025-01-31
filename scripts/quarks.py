@@ -124,78 +124,8 @@ class LorentzScalarsAreUniversal(eqx.Module):
         return self.layers[-1](X)[0]
 
 
-class PermEquivariantLayer(eqx.Module):
-    layers: dict[tuple[int, int], Union[ml.GeneralLinear, eqx.nn.Linear]]
-    input_keys: dict[int, int]
-    output_keys: dict[int, int]
-
-    def __init__(
-        self: Self, input_keys: dict[int, int], output_keys: dict[int, int], n: int, key: ArrayLike
-    ):
-        """
-        args:
-            input_keys: a map from tensor order to number of channels for the inputs
-            output_keys: a map from tensor order to number of channels for the outputs
-        """
-        self.input_keys = input_keys
-        self.output_keys = output_keys
-
-        self.layers = {}
-        for in_k, in_c in input_keys.items():
-            for out_k, out_c in output_keys.items():
-                key, subkey = random.split(key)
-                if in_k + out_k == 0:
-                    self.layers[(in_k, out_k)] = eqx.nn.Linear(in_c, out_c, key=subkey)
-                else:
-                    sym_axes = ()
-                    if in_k > 1 and out_k > 1:
-                        sym_axes = (tuple(range(in_k)), tuple(range(in_k, in_k + out_k)))
-                    elif in_k > 1:
-                        sym_axes = (tuple(range(in_k)),)
-                    elif out_k > 1:
-                        sym_axes = (tuple(range(out_k)),)
-
-                    # this class saves the perm invariant tensors, so they aren't reconstructed
-                    basis = utils.PermInvariantTensor.get(in_k + out_k, n, sym_axes)
-                    if out_k > 0:
-                        bias_basis = utils.PermInvariantTensor.get(
-                            out_k, n, (tuple(range(out_k)),) if out_k > 1 else ()
-                        )
-                    else:
-                        bias_basis = jnp.ones((1))
-
-                    self.layers[(in_k, out_k)] = ml.GeneralLinear(
-                        basis, in_c, out_c, True, bias_basis, subkey
-                    )
-
-    def __call__(self: Self, x: dict[int, ArrayLike]):
-        out_dict = {}
-        for in_k, tensor in x.items():
-            for out_k in self.output_keys.keys():
-                if out_k in out_dict:
-                    out_dict[out_k] = out_dict[out_k] + self.layers[(in_k, out_k)](tensor)
-                else:
-                    out_dict[out_k] = self.layers[(in_k, out_k)](tensor)
-
-        return out_dict
-
-    def count_params(self: Self):
-        return sum(
-            [
-                (
-                    layer.count_params()
-                    if isinstance(layer, ml.GeneralLinear)
-                    else sum(
-                        [x.size for x in jax.tree_util.tree_leaves(eqx.filter(layer, eqx.is_array))]
-                    )
-                )
-                for layer in self.layers.values()
-            ]
-        )
-
-
 class LorentzPermInvariant(eqx.Module):
-    perm_layers: list[PermEquivariantLayer]
+    perm_layers: list[ml.PermEquivariantLayer]
     layers: list[eqx.nn.Linear]
     n_particles: int
     n_added_vecs: int
@@ -233,19 +163,19 @@ class LorentzPermInvariant(eqx.Module):
 
             key, subkey = random.split(key)
             self.perm_layers.append(
-                PermEquivariantLayer(input_keys, output_keys, n_particles, subkey)
+                ml.PermEquivariantLayer(input_keys, output_keys, n_particles, subkey)
             )
             input_keys = output_keys
 
             for _ in range(n_hidden_perm_equiv - 1):
                 key, subkey = random.split(key)
                 self.perm_layers.append(
-                    PermEquivariantLayer(input_keys, output_keys, n_particles, subkey)
+                    ml.PermEquivariantLayer(input_keys, output_keys, n_particles, subkey)
                 )
 
         key, subkey = random.split(key)
         self.perm_layers.append(
-            PermEquivariantLayer(input_keys, {0: inv_width}, n_particles, subkey)
+            ml.PermEquivariantLayer(input_keys, {0: inv_width}, n_particles, subkey)
         )
 
         self.layers = []
