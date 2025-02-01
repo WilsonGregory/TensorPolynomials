@@ -1,6 +1,9 @@
+import sys
 import time
 import numpy as np
 from typing_extensions import Self
+import wandb
+import argparse
 
 import jax
 import jax.numpy as jnp
@@ -43,11 +46,12 @@ def get_data(
     train_file: str,
     test_file: str,
     n_train: int,
+    n_val: int,
     n_test: int,
     normalize: bool = True,
 ) -> tuple[jax.Array]:
     train_X, train_y = load_one_file(D, dir_path + train_file, n_train)
-    test_X, test_y = load_one_file(D, dir_path + test_file, n_test)
+    test_X, test_y = load_one_file(D, dir_path + test_file, n_val + n_test)
 
     if normalize:
         # Subtract a multiple of the identity so that the mean diagonal value is 0
@@ -68,32 +72,54 @@ def get_data(
         train_y = train_y / std_y_scalar
         test_y = test_y / std_y_scalar
 
-    return train_X, train_y, test_X, test_y
+    # now split test, val into two data sets
+    val_X = test_X[:n_val]
+    val_y = test_y[:n_val]
+
+    test_X = test_X[n_val:]
+    test_y = test_y[n_val:]
+
+    return train_X, train_y, val_X, val_y, test_X, test_y
 
 
-class BaselineMLP(eqx.Module):
+class CountableModule(eqx.Module):
+    """
+    An equinox module with the function count_params defined.
+    """
+
+    def count_params(self: Self) -> int:
+        return sum(
+            [
+                0 if x is None else x.size
+                for x in eqx.filter(jax.tree_util.tree_leaves(self), eqx.is_array)
+            ]
+        )
+
+
+class BaselineMLP(CountableModule):
     D: int
-    mlp: eqx.nn.MLP
+    net: eqx.nn.MLP
 
     def __init__(self: Self, D: int, width: int, num_hidden_layers: int, key: ArrayLike):
         """
         Baseline model which is just an mlp.
         """
         self.D = D
-        self.mlp = eqx.nn.MLP(D**2, D**2, width, num_hidden_layers, key=key)
+        self.net = eqx.nn.MLP(D**2, D**2, width, num_hidden_layers, key=key)
 
     def __call__(self: Self, x: ArrayLike) -> jax.Array:
-        return self.mlp(x.reshape(-1)).reshape((D,) * 2)
+        return self.net(x.reshape(-1)).reshape((D,) * 2)
 
 
-class SVHTwoTensor(eqx.Module):
+class TwoTensorMap(CountableModule):
     D: int
     net: eqx.nn.MLP
 
-    def __init__(self: Self, D: int, width: int, num_hidden_layers: int, key: ArrayLike):
+    def __init__(self: Self, D: int, width: int, n_hidden_layers: int, key: ArrayLike):
         """
-        Constructor for SparseVectorHunter whose input is a symmetric 2-tensor and output is a
-        symmetric 2-tensor.
+        Constructor for model whose input is a symmetric 2-tensor and output is a
+        symmetric 2-tensor. It performs an eigenvalue decomposition, maps the eigenvalues with
+        an MLP, then reconstructs the matrix.
         args:
             D (int): dimension of the tensor
             width (int): width of the NN layers
@@ -101,7 +127,7 @@ class SVHTwoTensor(eqx.Module):
             key (rand key): the  random key
         """
         self.D = D
-        self.net = eqx.nn.MLP(self.D + 1, "scalar", width, num_hidden_layers, key=key)
+        self.net = eqx.nn.MLP(self.D, self.D, width, n_hidden_layers, key=key)
 
     def __call__(self: Self, x: ArrayLike) -> jax.Array:
         """
@@ -109,29 +135,30 @@ class SVHTwoTensor(eqx.Module):
             x (jnp.array): (d,d) array,
         """
         eigvals, eigvecs = jnp.linalg.eigh(x)
-        # construct (d,d+1) where the ith row is [lambda_1, lambda_2, lambda_3, lambda_i]
-        extended_eigvals = jnp.concatenate(
-            [jnp.full((3, 3), eigvals), eigvals.reshape((3, 1))], axis=1
-        )
-        out = jax.vmap(self.net)(extended_eigvals)
-
-        return eigvecs @ jnp.diag(out) @ eigvecs.T
+        return eigvecs @ jnp.diag(self.net(eigvals)) @ eigvecs.T
 
 
-class SVHTwoTensorPermEquivariant(eqx.Module):
+class TwoTensorMapPermEquivariant(CountableModule):
     D: int
     equiv_layers: list[ml.PermEquivariantLayer]
 
     def __init__(self: Self, D: int, width: int, n_hidden_layers: int, key: ArrayLike):
         """
-        Version of SVH with symmetric 2-tensor inputs/outputs where the polynomial of eigenvalues
-        is explicitly symmetric in the first three arguments.
+        Constructor for model whose input is a symmetric 2-tensor and output is a
+        symmetric 2-tensor. It performs an eigenvalue decomposition, maps the eigenvalues, then
+        reconstructs the matrix. In this version, the function that maps the eigenvalues is
+        permutation equivariant, as the theory suggests.
+        args:
+            D (int): dimension of the tensor
+            width (int): width of the NN layers
+            num_hidden_layers (int): number of hidden layers, input/output of width
+            key (rand key): the  random key
         """
         self.D = D
 
         key, subkey = random.split(key)
         self.equiv_layers = [ml.PermEquivariantLayer({1: 1}, {1: width}, D, subkey)]
-        for _ in range(n_hidden_layers):
+        for _ in range(n_hidden_layers - 1):
             key, subkey = random.split(key)
             self.equiv_layers.append(ml.PermEquivariantLayer({1: width}, {1: width}, D, subkey))
 
@@ -148,9 +175,12 @@ class SVHTwoTensorPermEquivariant(eqx.Module):
         for layer in self.equiv_layers[:-1]:
             evals_dict = {k: jax.nn.relu(tensor) for k, tensor in layer(evals_dict).items()}
 
-        eigvals = self.equiv_layers[-1](evals_dict)[1][0]  # select the first (only) channel
+        eigvals = self.equiv_layers[-1](evals_dict)[1].reshape((3,))
 
         return eigvecs @ jnp.diag(eigvals) @ eigvecs.T
+
+    def count_params(self: Self) -> int:
+        return sum(x.count_params() for x in self.equiv_layers)
 
 
 def map_and_loss(model, x, y, aux_data):
@@ -166,60 +196,101 @@ def map_and_loss(model, x, y, aux_data):
     return jnp.mean(jnp.linalg.matrix_norm(pred_y - y)), aux_data
 
 
-# Main
-key = random.PRNGKey(time.time_ns())
-key, subkey = random.split(key)
-train = True
-save = False
-save_dir = "../runs/"
-table_print = True
+def handleArgs(argv):
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "data", help="the folder containing neohookean_train.csv and neohookean_val.csv", type=str
+    )
+    parser.add_argument("-e", "--epochs", help="number of epochs to run", type=int, default=50)
+    parser.add_argument("--batch", help="batch size", type=int, default=256)
+    parser.add_argument("--n_train", help="number of training points", type=int, default=20000)
+    parser.add_argument("--n_val", help="number of validation points", type=int, default=4000)
+    parser.add_argument("--n_test", help="number of testing points", type=int, default=4000)
+    parser.add_argument("-t", "--n_trials", help="number of trials to run", type=int, default=1)
+    parser.add_argument("--seed", help="the random number seed", type=int, default=None)
+    parser.add_argument(
+        "-s", "--save_model", help="file name to save the params", type=str, default=None
+    )
+    parser.add_argument(
+        "-l", "--load_model", help="file name to load params from", type=str, default=None
+    )
+    parser.add_argument(
+        "-v", "--verbose", help="verbose argument passed to trainer", type=int, default=1
+    )
+    parser.add_argument(
+        "--normalize",
+        help="normalize input data, equivariantly",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--wandb",
+        help="whether to use wandb on this run",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--wandb-entity", help="the wandb user", type=str, default="wilson_gregory")
+    parser.add_argument(
+        "--wandb-project", help="the wandb project", type=str, default="tensor-polynomials"
+    )
 
-# define data params
+    return parser.parse_args()
+
+
+# Main
+args = handleArgs(sys.argv)
+key = random.PRNGKey(time.time_ns()) if (args.seed is None) else random.PRNGKey(args.seed)
 D = 3
-n_train = 5000
-n_test = 4000
 
 # define training params
 width = 23
-num_hidden_layers = 3
-batch_size = 256
-trials = 1
-verbose = 2
+n_hidden_layers = 3
 
-train_X, train_y, test_X, test_y = get_data(
+train_X, train_y, val_X, val_y, test_X, test_y = get_data(
     D,
-    "/data/wgregor4/tfenn/neohookean/",
+    args.data,
     "neohookean_train.csv",
     "neohookean_val.csv",
-    n_train,
-    n_test,
+    args.n_train,
+    args.n_val,
+    args.n_test,
 )
 
 key, subkey1, subkey2, subkey3 = random.split(key, 4)
 models_list = [
     (
-        "SVHTwoTensorPermEquivariant",
-        1e-3,
-        SVHTwoTensorPermEquivariant(D, width, num_hidden_layers, subkey2),
+        "TwoTensorMapPermEquivariant23",
+        7e-4,
+        TwoTensorMapPermEquivariant(D, width, n_hidden_layers, subkey1),
     ),
-    ("SVHTwoTensor", 1e-3, SVHTwoTensor(D, width, num_hidden_layers, subkey1)),
-    ("BaselineMLP", 1e-3, BaselineMLP(D, 2 * width, num_hidden_layers, subkey3)),
+    ("TwoTensorMap32", 1e-3, TwoTensorMap(D, 32, n_hidden_layers, subkey2)),
+    ("BaselineMLP32", 1e-3, BaselineMLP(D, 32, n_hidden_layers, subkey3)),
 ]
 
 for model_name, lr, model in models_list:
-    num_params = sum(
-        [
-            0 if x is None else x.size
-            for x in eqx.filter(jax.tree_util.tree_leaves(model), eqx.is_array)
-        ]
-    )
-    print(f"{model_name} params: {num_params:,}")
+    print(f"{model_name} params: {model.count_params():,}")
 
-results = np.zeros((trials, len(models_list), 2))
-if train:
-    for t in range(trials):
-        for k, (model_name, lr, model) in enumerate(models_list):
-            steps_per_epoch = int(n_train / batch_size)
+results = np.zeros((args.n_trials, len(models_list), 2))
+for t in range(args.n_trials):
+    for k, (model_name, lr, model) in enumerate(models_list):
+
+        name = f"materials_{model_name}_t{t}_lr{lr}_bs{args.batch}"
+        print(name)
+
+        if args.load_model:
+            trained_model = ml.load(args.load_model, model)
+        else:
+            if args.wandb:
+                wandb.init(
+                    project=args.wandb_project,
+                    entity=args.wandb_entity,  # what is this?
+                    name=name,
+                    settings=wandb.Settings(start_method="fork"),
+                )
+                wandb.config.update(args)
+                wandb.config.update({"trial": t, "model_name": model_name, "lr": lr})
+
+            steps_per_epoch = int(args.n_train / args.batch)
             key, subkey = random.split(key)
             trained_model, _, _, _ = ml.train(
                 train_X,
@@ -227,14 +298,24 @@ if train:
                 map_and_loss,
                 model,
                 subkey,
-                ml.EpochStop(epochs=20, verbose=verbose),
-                batch_size,
-                optax.adam(optax.exponential_decay(lr, int(n_train / batch_size), 0.995)),
+                ml.EpochStop(epochs=args.epochs, verbose=args.verbose),
+                args.batch,
+                optax.adam(optax.exponential_decay(lr, steps_per_epoch, 0.995)),
+                validation_X=val_X,
+                validation_Y=val_y,
+                save_model=args.save_model,
+                is_wandb=args.wandb,
             )
 
-            results[t, k, 0] = map_and_loss(trained_model, train_X, train_y, None)[0]
-            results[t, k, 1] = map_and_loss(trained_model, test_X, test_y, None)[0]
-            print(f"{t},{model_name}: {results[t,k,1]}")
+            if args.wandb:
+                wandb.finish()
+
+            if args.save_model is not None:
+                ml.save(args.save_model, trained_model)
+
+        results[t, k, 0] = map_and_loss(trained_model, train_X, train_y, None)[0]
+        results[t, k, 1] = map_and_loss(trained_model, test_X, test_y, None)[0]
+        print(f"{t},{model_name}: {results[t,k,1]}")
 
 print(results)
 print("mean over trials", jnp.mean(results, axis=0))

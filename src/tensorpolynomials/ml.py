@@ -2,6 +2,7 @@ import time
 import math
 import functools
 from typing_extensions import Any, Callable, Optional, Union, Self
+import wandb
 
 import jax
 import jax.numpy as jnp
@@ -480,6 +481,7 @@ def train(
     save_model: Optional[str] = None,
     devices: Optional[list[jax.Device]] = None,
     aux_data: Optional[eqx.nn.State] = None,
+    is_wandb: bool = False,
 ) -> Union[tuple[eqx.Module, Any, jax.Array, jax.Array], tuple[eqx.Module, jax.Array, jax.Array]]:
     """
     Method to train the model. It uses stochastic gradient descent (SGD) with the optimizer to learn the
@@ -504,6 +506,7 @@ def train(
         save_model (str): if string, save model every 10 epochs, defaults to None
         aux_data (eqx.nn.State): initial aux data passed in to map_and_loss when has_aux is true.
         devices (list): gpu/cpu devices to use, if None (default) then it will use jax.devices()
+        is_wandb (bool): whether we are logging to wandb. It should already be initialized.
     returns: A tuple of best model in inference mode, epoch loss, and val loss
     """
     if isinstance(stop_condition, ValLoss) and (validation_X is None or validation_Y is None):
@@ -535,7 +538,7 @@ def train(
             epoch_loss += loss_value
 
         epoch_loss = epoch_loss / len(X_batches)
-        epoch += 1
+        log = {"train/loss": epoch_loss}
 
         # We evaluate the validation loss in batches for memory reasons.
         if validation_X is not None and validation_Y is not None:
@@ -550,10 +553,15 @@ def train(
                 aux_data=aux_data,
             )
             val_loss = epoch_val_loss
+            log["val/loss"] = val_loss
+
+        if is_wandb:
+            wandb.log(log)
 
         if save_model and ((epoch % 10) == 0):
             save(save_model, stop_condition.best_model)
 
         epoch_time = time.time() - start_time
+        epoch += 1
 
     return stop_condition.best_model, aux_data, epoch_loss, val_loss
