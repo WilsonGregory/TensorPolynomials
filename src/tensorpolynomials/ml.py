@@ -165,7 +165,7 @@ def get_batches(X, y, batch_size, rand_key, devices):
 
     X_batches = []
     y_batches = []
-    batch_indices = random.permutation(rand_key, len(X))
+    batch_indices = jnp.arange(len(X)) if rand_key is None else random.permutation(rand_key, len(X))
     # if total size is not divisible by batch, the remainder will be ignored
     for i in range(int(math.floor(len(X) / batch_size))):  # iterate through the batches of an epoch
         idxs = batch_indices[i * batch_size : (i + 1) * batch_size]
@@ -478,6 +478,15 @@ def train(
     optimizer: optax.GradientTransformation,
     validation_X: Optional[ArrayLike] = None,
     validation_Y: Optional[ArrayLike] = None,
+    val_map_and_loss: Optional[
+        Union[
+            Callable[[eqx.Module, ArrayLike, ArrayLike], jax.Array],
+            Callable[
+                [eqx.Module, ArrayLike, ArrayLike, Any],
+                tuple[jax.Array, Any],
+            ],
+        ]
+    ] = None,
     save_model: Optional[str] = None,
     devices: Optional[list[jax.Device]] = None,
     aux_data: Optional[eqx.nn.State] = None,
@@ -513,6 +522,7 @@ def train(
         raise ValueError("Stop condition is ValLoss, but no validation data provided.")
 
     devices = devices if devices else jax.devices()
+    val_map_and_loss = map_and_loss if val_map_and_loss is None else val_map_and_loss
 
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
     epoch = 0
@@ -543,7 +553,7 @@ def train(
         # We evaluate the validation loss in batches for memory reasons.
         if validation_X is not None and validation_Y is not None:
             epoch_val_loss = map_loss_in_batches(
-                map_and_loss,
+                val_map_and_loss,
                 model,
                 validation_X,
                 validation_Y,

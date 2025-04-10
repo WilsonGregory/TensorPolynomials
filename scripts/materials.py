@@ -1,9 +1,10 @@
 import sys
 import time
 import numpy as np
-from typing_extensions import Self
+from typing_extensions import Optional, Self, Union
 import wandb
 import argparse
+import functools as ft
 
 import jax
 import jax.numpy as jnp
@@ -53,25 +54,6 @@ def get_data(
     train_X, train_y = load_one_file(D, dir_path + train_file, n_train)
     test_X, test_y = load_one_file(D, dir_path + test_file, n_val + n_test)
 
-    if normalize:
-        # Subtract a multiple of the identity so that the mean diagonal value is 0
-        mean_X_scalar = jnp.mean(jnp.diag(jnp.mean(train_X, axis=0)))
-        train_X = train_X - mean_X_scalar * jnp.eye(D)
-        test_X = test_X - mean_X_scalar * jnp.eye(D)
-
-        mean_y_scalar = jnp.mean(jnp.diag(jnp.mean(train_y, axis=0)))
-        train_y = train_y - mean_y_scalar * jnp.eye(D)
-        test_y = test_y - mean_y_scalar * jnp.eye(D)
-
-        # Divide by the standard deviation so that the std component is 1
-        std_X_scalar = jnp.std(train_X)
-        train_X = train_X / std_X_scalar
-        test_X = test_X / std_X_scalar
-
-        std_y_scalar = jnp.std(train_y)
-        train_y = train_y / std_y_scalar
-        test_y = test_y / std_y_scalar
-
     # now split test, val into two data sets
     val_X = test_X[:n_val]
     val_y = test_y[:n_val]
@@ -80,6 +62,64 @@ def get_data(
     test_y = test_y[n_val:]
 
     return train_X, train_y, val_X, val_y, test_X, test_y
+
+
+def normalize_data(
+    D: int,
+    train_X: jax.Array,
+    train_y: jax.Array,
+    val_X: jax.Array,
+    val_y: jax.Array,
+    test_X: jax.Array,
+    test_y: jax.Array,
+    normalize_type: str,
+):
+    global_y_std = jnp.std(train_y)
+
+    if normalize_type == "componentwise":
+        mean_X = jnp.mean(train_X, axis=0, keepdims=True)  # (1,D,D)
+        mean_y = jnp.mean(train_y, axis=0, keepdims=True)
+        std_X = jnp.std(train_X, axis=0, keepdims=True)
+        std_y = jnp.std(train_y, axis=0, keepdims=True)
+
+        scaler = std_y / global_y_std
+
+    elif normalize_type == "tensor":
+        # Subtract a multiple of the identity so that the mean diagonal value is 0
+        mean_X = jnp.mean(jnp.diag(jnp.mean(train_X, axis=0))) * jnp.eye(D)[None]
+        mean_y = jnp.mean(jnp.diag(jnp.mean(train_y, axis=0))) * jnp.eye(D)[None]
+        std_X = jnp.std(train_X)
+        std_y = jnp.std(train_y)
+
+        scaler = std_y / global_y_std  # this will be 1
+
+    elif normalize_type == "eigenvalues_perm":
+        eigvals_X = jnp.linalg.eigvalsh(train_X)
+        mean_X = jnp.mean(eigvals_X) * jnp.eye(D)[None]  # works in every basis
+        eigvals_y = jnp.linalg.eigvalsh(train_y)
+        mean_y = jnp.mean(eigvals_y) * jnp.eye(D)[None]
+        std_X = jnp.std(eigvals_X)
+        std_y = jnp.std(eigvals_y)
+
+        scaler = std_y / global_y_std
+
+    train_X = train_X - mean_X
+    val_X = val_X - mean_X
+    test_X = test_X - mean_X
+
+    train_y = train_y - mean_y
+    val_y = val_y - mean_y
+    test_y = test_y - mean_y
+
+    train_X = train_X / std_X
+    val_X = val_X / std_X
+    test_X = test_X / std_X
+
+    train_y = train_y / std_y
+    val_y = val_y / std_y
+    test_y = test_y / std_y
+
+    return train_X, train_y, val_X, val_y, test_X, test_y, scaler
 
 
 class CountableModule(eqx.Module):
@@ -105,7 +145,7 @@ class BaselineMLP(CountableModule):
         Baseline model which is just an mlp.
         """
         self.D = D
-        self.net = eqx.nn.MLP(D**2, D**2, width, num_hidden_layers, key=key)
+        self.net = eqx.nn.MLP(D**2, D**2, width, num_hidden_layers, jax.nn.gelu, key=key)
 
     def __call__(self: Self, x: ArrayLike) -> jax.Array:
         return self.net(x.reshape(-1)).reshape((D,) * 2)
@@ -127,7 +167,7 @@ class TwoTensorMap(CountableModule):
             key (rand key): the  random key
         """
         self.D = D
-        self.net = eqx.nn.MLP(self.D, self.D, width, n_hidden_layers, key=key)
+        self.net = eqx.nn.MLP(self.D, self.D, width, n_hidden_layers, jax.nn.gelu, key=key)
 
     def __call__(self: Self, x: ArrayLike) -> jax.Array:
         """
@@ -173,7 +213,7 @@ class TwoTensorMapPermEquivariant(CountableModule):
         eigvals, eigvecs = jnp.linalg.eigh(x)
         evals_dict = {1: eigvals[None]}  # (1,D)
         for layer in self.equiv_layers[:-1]:
-            evals_dict = {k: jax.nn.relu(tensor) for k, tensor in layer(evals_dict).items()}
+            evals_dict = {k: jax.nn.gelu(tensor) for k, tensor in layer(evals_dict).items()}
 
         eigvals = self.equiv_layers[-1](evals_dict)[1].reshape((3,))
 
@@ -183,17 +223,29 @@ class TwoTensorMapPermEquivariant(CountableModule):
         return sum(x.count_params() for x in self.equiv_layers)
 
 
-def map_and_loss(model, x, y, aux_data):
+def map_and_loss(
+    model: eqx.Module,
+    x: jax.Array,
+    y: jax.Array,
+    aux_data: Optional[eqx.nn.State],
+    scaler: Optional[Union[float, jax.Array]] = None,
+):
     """
     Map x using the model,
     args:
         model (functional): function on a single input, will be vmapped
-        x (jnp.array): input data, shape (batch,n,d)
-        y (jnp.array): output data, the sparse vector, shape (batch,n)
+        x (jnp.array): input data, shape (batch,d,d)
+        y (jnp.array): output data, the sparse vector, shape (batch,d,d)
+        aux_data (): optional aux data used for BatchNorm and the like
+        scaler ():
     """
     pred_y = jax.vmap(model)(x)
+    if scaler is not None:
+        pred_y = pred_y * scaler
+        y = y * scaler
+
     # use mse, mean over batch, sum over tensor components
-    return jnp.mean(jnp.linalg.matrix_norm(pred_y - y)), aux_data
+    return jnp.mean(jnp.linalg.matrix_norm(pred_y - y) ** 2), aux_data
 
 
 def handleArgs(argv):
@@ -203,16 +255,16 @@ def handleArgs(argv):
     )
     parser.add_argument("-e", "--epochs", help="number of epochs to run", type=int, default=50)
     parser.add_argument("--batch", help="batch size", type=int, default=256)
-    parser.add_argument("--n_train", help="number of training points", type=int, default=20000)
-    parser.add_argument("--n_val", help="number of validation points", type=int, default=4000)
-    parser.add_argument("--n_test", help="number of testing points", type=int, default=4000)
-    parser.add_argument("-t", "--n_trials", help="number of trials to run", type=int, default=1)
+    parser.add_argument("--n-train", help="number of training points", type=int, default=20000)
+    parser.add_argument("--n-val", help="number of validation points", type=int, default=4000)
+    parser.add_argument("--n-test", help="number of testing points", type=int, default=4000)
+    parser.add_argument("-t", "--n-trials", help="number of trials to run", type=int, default=1)
     parser.add_argument("--seed", help="the random number seed", type=int, default=None)
     parser.add_argument(
-        "-s", "--save_model", help="file name to save the params", type=str, default=None
+        "-s", "--save-model", help="file name to save the params", type=str, default=None
     )
     parser.add_argument(
-        "-l", "--load_model", help="file name to load params from", type=str, default=None
+        "-l", "--load-model", help="file name to load params from", type=str, default=None
     )
     parser.add_argument(
         "-v", "--verbose", help="verbose argument passed to trainer", type=int, default=1
@@ -246,7 +298,7 @@ D = 3
 width = 23
 n_hidden_layers = 3
 
-train_X, train_y, val_X, val_y, test_X, test_y = get_data(
+data = get_data(
     D,
     args.data,
     "neohookean_train.csv",
@@ -260,25 +312,30 @@ key, subkey1, subkey2, subkey3 = random.split(key, 4)
 models_list = [
     (
         "TwoTensorMapPermEquivariant23",
-        7e-4,
+        1e-3,  # 1e-3 for 20k, 2e-3 for 5k
         TwoTensorMapPermEquivariant(D, width, n_hidden_layers, subkey1),
+        "eigenvalues_perm",
     ),
-    ("TwoTensorMap32", 1e-3, TwoTensorMap(D, 32, n_hidden_layers, subkey2)),
-    ("BaselineMLP32", 1e-3, BaselineMLP(D, 32, n_hidden_layers, subkey3)),
+    ("TwoTensorMap32", 3e-3, TwoTensorMap(D, 32, n_hidden_layers, subkey2), "eigenvalues_perm"),
+    ("BaselineMLP32", 3e-3, BaselineMLP(D, 32, n_hidden_layers, subkey3), "componentwise"),
 ]
 
-for model_name, lr, model in models_list:
+for model_name, _, model, _ in models_list:
     print(f"{model_name} params: {model.count_params():,}")
 
-results = np.zeros((args.n_trials, len(models_list), 2))
+results = np.zeros((args.n_trials, len(models_list), 3))
 for t in range(args.n_trials):
-    for k, (model_name, lr, model) in enumerate(models_list):
+    for k, (model_name, lr, model, normalize_type) in enumerate(models_list):
 
-        name = f"materials_{model_name}_t{t}_lr{lr}_bs{args.batch}"
-        print(name)
+        name = f"materials_{model_name}_t{t}_lr{lr}_e{args.epochs}_ntrain{args.n_train}"
+        save_model = f"{args.save_model}/{name}.eqx" if args.save_model is not None else None
+
+        train_X, train_y, val_X, val_y, test_X, test_y, scaler = normalize_data(
+            D, *data, normalize_type
+        )
 
         if args.load_model:
-            trained_model = ml.load(args.load_model, model)
+            trained_model = ml.load(f"{args.load_model}/{name}.eqx", model)
         else:
             if args.wandb:
                 wandb.init(
@@ -288,7 +345,14 @@ for t in range(args.n_trials):
                     settings=wandb.Settings(start_method="fork"),
                 )
                 wandb.config.update(args)
-                wandb.config.update({"trial": t, "model_name": model_name, "lr": lr})
+                wandb.config.update(
+                    {
+                        "trial": t,
+                        "model_name": model_name,
+                        "lr": lr,
+                        "normalize_type": normalize_type,
+                    }
+                )
 
             steps_per_epoch = int(args.n_train / args.batch)
             key, subkey = random.split(key)
@@ -300,10 +364,15 @@ for t in range(args.n_trials):
                 subkey,
                 ml.EpochStop(epochs=args.epochs, verbose=args.verbose),
                 args.batch,
-                optax.adam(optax.exponential_decay(lr, steps_per_epoch, 0.995)),
+                optax.adamw(
+                    optax.cosine_onecycle_schedule(
+                        args.epochs * args.n_train // args.batch, lr, div_factor=3
+                    )
+                ),
                 validation_X=val_X,
                 validation_Y=val_y,
-                save_model=args.save_model,
+                val_map_and_loss=ft.partial(map_and_loss, scaler=scaler),  # correct scaler?
+                save_model=save_model,
                 is_wandb=args.wandb,
             )
 
@@ -311,11 +380,38 @@ for t in range(args.n_trials):
                 wandb.finish()
 
             if args.save_model is not None:
-                ml.save(args.save_model, trained_model)
+                ml.save(save_model, trained_model)
 
-        results[t, k, 0] = map_and_loss(trained_model, train_X, train_y, None)[0]
-        results[t, k, 1] = map_and_loss(trained_model, test_X, test_y, None)[0]
-        print(f"{t},{model_name}: {results[t,k,1]}")
+        key, subkey1, subkey2, subkey3 = random.split(key, num=4)
+        results[t, k, 0] = ml.map_loss_in_batches(
+            ft.partial(map_and_loss, scaler=scaler),
+            trained_model,
+            train_X,
+            train_y,
+            args.batch,
+            subkey1,
+            devices=jax.devices(),
+        )
+        results[t, k, 1] = ml.map_loss_in_batches(
+            ft.partial(map_and_loss, scaler=scaler),
+            trained_model,
+            val_X,
+            val_y,
+            args.batch,
+            subkey1,
+            devices=jax.devices(),
+        )
+        results[t, k, 2] = ml.map_loss_in_batches(
+            ft.partial(map_and_loss, scaler=scaler),
+            trained_model,
+            test_X,
+            test_y,
+            args.batch,
+            subkey1,
+            devices=jax.devices(),
+        )
+        print(f"{t},{model_name}: {results[t,k,2]}")
 
 print(results)
 print("mean over trials", jnp.mean(results, axis=0))
+print("std over trials", jnp.std(results, axis=0))
