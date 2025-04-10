@@ -316,8 +316,8 @@ models_list = [
         TwoTensorMapPermEquivariant(D, width, n_hidden_layers, subkey1),
         "eigenvalues_perm",
     ),
-    # ("TwoTensorMap32", 3e-3, TwoTensorMap(D, 32, n_hidden_layers, subkey2), "eigenvalues_perm"),
-    # ("BaselineMLP32", 3e-3, BaselineMLP(D, 32, n_hidden_layers, subkey3), "componentwise"),
+    ("TwoTensorMap32", 3e-3, TwoTensorMap(D, 32, n_hidden_layers, subkey2), "eigenvalues_perm"),
+    ("BaselineMLP32", 3e-3, BaselineMLP(D, 32, n_hidden_layers, subkey3), "componentwise"),
 ]
 
 for model_name, _, model, _ in models_list:
