@@ -325,7 +325,7 @@ def evaluate(
             out_axes=(0, None, 0),
         )
         loss, _, out = compute_loss_pmap(inference_model, x, y, aux_data)
-        return jnp.mean(loss, axis=0), out.reshape(-1)
+        return jnp.mean(loss, axis=0), out.reshape((-1,) + out.shape[2:])
     else:
         compute_loss_pmap = eqx.filter_pmap(
             map_and_loss,
@@ -355,8 +355,7 @@ def data_reducer(ls):
     """
     If map data returns the mapped data, merge them togther
     """
-    # TODO: fix this
-    return functools.reduce(lambda carry, val: carry.concat(val), ls, ls[0].empty())
+    return jnp.concatenate(ls)
 
 
 def map_loss_in_batches(
