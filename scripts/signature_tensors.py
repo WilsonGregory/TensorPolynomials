@@ -219,8 +219,8 @@ def map_and_loss(
     model: eqx.Module,
     x: jax.Array,
     y: jax.Array,
-    aux_data: Optional[eqx.nn.State],
-) -> jax.Array:
+    aux_data: eqx.nn.State | None,
+) -> tuple[jax.Array, eqx.nn.State | None]:
     """
 
     args:
@@ -258,8 +258,8 @@ def map_and_loss_return_map(
     model: eqx.Module,
     x: jax.Array,
     y: jax.Array,
-    aux_data: Optional[eqx.nn.State],
-) -> tuple[jax.Array, jax.Array]:
+    aux_data: eqx.nn.State | None,
+) -> tuple[jax.Array, eqx.nn.State | None, jax.Array]:
     """
     args:
         model:

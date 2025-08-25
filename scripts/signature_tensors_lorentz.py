@@ -1,10 +1,9 @@
 import sys
 import time
 import numpy as np
-from typing_extensions import Optional, Self, Union
+from typing_extensions import Self
 import wandb
 import argparse
-import functools as ft
 
 import jax
 import jax.numpy as jnp
@@ -26,7 +25,7 @@ def get_dataset(
     sig_order: int,
     subsample_steps: int,
     key: ArrayLike,
-) -> tuple[jax.Array, list[jax.Array]]:
+) -> tuple[jax.Array, jax.Array]:
     t = jnp.linspace(0, 1, num=integrator_steps)
     library = jnp.stack([jnp.ones_like(t), t, t**2, t**3, t**4, t**5], axis=-1)  # (steps, library)
     coeffs = random.normal(key, shape=(n_curves, library.shape[1], D))  # (batch,library,channels)
@@ -38,7 +37,7 @@ def get_dataset(
 
 def get_data(
     D: int, n_train: int, n_val: int, n_test: int, sig_order: int, steps: int, key: ArrayLike
-) -> jax.Array:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     integrator_steps = 1000
     subkey1, subkey2, subkey3 = random.split(key, num=3)
 
@@ -70,13 +69,13 @@ class SignaxOnly(eqx.Module):
 
 class Baseline(eqx.Module):
 
-    net: eqx.Module
+    net: eqx.nn.MLP
 
     max_k: int
 
     def __init__(
-        self: Self, D: int, max_k: int, steps: int, width: int, depth: int, key: ArrayLike
-    ) -> Self:
+        self: Self, D: int, max_k: int, steps: int, width: int, depth: int, key: jax.Array
+    ) -> None:
         self.max_k = max_k
         assert max_k <= 3, "EquivSignature currently can only handle up to max_k=3"
 
@@ -91,13 +90,12 @@ class Baseline(eqx.Module):
 
 class EquivSignature(eqx.Module):
 
-    net: eqx.Module
-
+    net: eqx.nn.MLP
     max_k: int
 
     def __init__(
-        self: Self, max_k: int, steps: int, width: int, depth: int, key: ArrayLike
-    ) -> Self:
+        self: Self, max_k: int, steps: int, width: int, depth: int, key: jax.Array
+    ) -> None:
         self.max_k = max_k
         assert max_k <= 3, "EquivSignature currently can only handle up to max_k=3"
 
@@ -139,8 +137,8 @@ class EquivSignature(eqx.Module):
 
 
 def map_and_loss(
-    model: eqx.Module, x: jax.Array, y: jax.Array, aux_data: Optional[eqx.nn.State]
-) -> jax.Array:
+    model: eqx.Module, x: jax.Array, y: jax.Array, aux_data: eqx.nn.State | None
+) -> tuple[jax.Array, eqx.nn.State | None]:
     """
 
     args:
@@ -149,6 +147,7 @@ def map_and_loss(
         y: output data, shape (batch, sum_k=1^K: D**k)
     """
     batch, _, D = x.shape
+    assert callable(model)
     pred_signature = jax.vmap(model)(x)
 
     idx = 0
