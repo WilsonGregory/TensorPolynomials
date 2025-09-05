@@ -24,9 +24,9 @@ class GeneralLinear(eqx.Module):
     in_features: int = eqx.field(static=True)
     out_features: int = eqx.field(static=True)
     use_bias: bool = eqx.field(static=True)
-    bias_basis: Array
+    bias_basis: Array | None
     weights: Array
-    bias: Array
+    bias: Array | None
 
     def __init__(
         self,
@@ -34,9 +34,12 @@ class GeneralLinear(eqx.Module):
         in_features: int,
         out_features: int,
         use_bias: bool = True,
-        bias_basis: Array = None,
-        key=None,
+        bias_basis: Array | None = None,
+        key: Array | None = None,
     ):
+        if key is None:
+            raise ValueError
+
         self.basis = basis
         self.in_features = in_features
         self.out_features = out_features
@@ -54,6 +57,9 @@ class GeneralLinear(eqx.Module):
         )
 
         if self.use_bias:
+            if self.bias_basis is None:
+                raise ValueError
+
             self.bias = random.uniform(
                 bkey,
                 shape=(out_features, len(self.bias_basis)),
@@ -84,11 +90,11 @@ class GeneralLinear(eqx.Module):
         return out
 
     def count_params(self: Self):
-        return self.weights.size + self.bias.size
+        return self.weights.size + (0 if self.bias is None else self.bias.size)
 
 
 class PermEquivariantLayer(eqx.Module):
-    layers: dict[tuple[int, int], Union[GeneralLinear, eqx.nn.Linear]]
+    layers: dict[tuple[int, int], GeneralLinear | eqx.nn.Linear]
     input_keys: dict[int, int]
     output_keys: dict[int, int]
 
@@ -131,7 +137,7 @@ class PermEquivariantLayer(eqx.Module):
                         basis, in_c, out_c, True, bias_basis, subkey
                     )
 
-    def __call__(self: Self, x: dict[int, ArrayLike]):
+    def __call__(self: Self, x: dict[int, Array]):
         out_dict = {}
         for in_k, tensor in x.items():
             for out_k in self.output_keys.keys():
