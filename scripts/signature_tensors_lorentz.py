@@ -271,7 +271,7 @@ for t in range(args.n_trials):
                     args.batch,
                     optax.adamw(
                         optax.cosine_onecycle_schedule(
-                            args.epochs * args.n_train // args.batch, lr, div_factor=3
+                            args.epochs * steps_per_epoch, lr, div_factor=3
                         )
                     ),
                     validation_X=val_X,

@@ -34,7 +34,7 @@ def voigt_to_full(D: int, rows: ArrayLike) -> jax.Array:
     return jax.vmap(form_tensor)(rows)
 
 
-def load_one_file(D: int, file_path: str, num: int) -> tuple[jax.Array]:
+def load_one_file(D: int, file_path: str, num: int) -> tuple[jax.Array, jax.Array]:
     # tensors are saved in Voigt notation, so we convert them to full representation
     rows = jnp.array(np.loadtxt(file_path, delimiter=",", skiprows=1))[:num]
     return voigt_to_full(D, rows[:, :6]), voigt_to_full(D, rows[:, 6:])
@@ -49,8 +49,7 @@ def get_data(
     n_train: int,
     n_val: int,
     n_test: int,
-    normalize: bool = True,
-) -> tuple[jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     train_X, train_y = load_one_file(D, dir_path + train_file, n_train)
     test_X, test_y = load_one_file(D, dir_path + test_file, n_val + n_test)
 
@@ -140,14 +139,14 @@ class BaselineMLP(CountableModule):
     D: int
     net: eqx.nn.MLP
 
-    def __init__(self: Self, D: int, width: int, num_hidden_layers: int, key: ArrayLike):
+    def __init__(self: Self, D: int, width: int, num_hidden_layers: int, key: jax.Array):
         """
         Baseline model which is just an mlp.
         """
         self.D = D
         self.net = eqx.nn.MLP(D**2, D**2, width, num_hidden_layers, jax.nn.gelu, key=key)
 
-    def __call__(self: Self, x: ArrayLike) -> jax.Array:
+    def __call__(self: Self, x: jax.Array) -> jax.Array:
         return self.net(x.reshape(-1)).reshape((D,) * 2)
 
 
@@ -155,7 +154,7 @@ class TwoTensorMap(CountableModule):
     D: int
     net: eqx.nn.MLP
 
-    def __init__(self: Self, D: int, width: int, n_hidden_layers: int, key: ArrayLike):
+    def __init__(self: Self, D: int, width: int, n_hidden_layers: int, key: jax.Array):
         """
         Constructor for model whose input is a symmetric 2-tensor and output is a
         symmetric 2-tensor. It performs an eigenvalue decomposition, maps the eigenvalues with
@@ -205,7 +204,7 @@ class TwoTensorMapPermEquivariant(CountableModule):
         key, subkey = random.split(key)
         self.equiv_layers.append(ml.PermEquivariantLayer({1: width}, {1: 1}, D, subkey))
 
-    def __call__(self: Self, x: ArrayLike) -> jax.Array:
+    def __call__(self: Self, x: jax.Array) -> jax.Array:
         """
         args:
             x (jnp.array): (d,d) array,
@@ -239,6 +238,7 @@ def map_and_loss(
         aux_data (): optional aux data used for BatchNorm and the like
         scaler ():
     """
+    assert callable(model)
     pred_y = jax.vmap(model)(x)
     if scaler is not None:
         pred_y = pred_y * scaler
@@ -316,6 +316,8 @@ models_list = [
         TwoTensorMapPermEquivariant(D, width, n_hidden_layers, subkey1),
         "eigenvalues_perm",
     ),
+    # having trouble reproducing results with the non-permutation equivariant model
+    # this model was already "canonicalized" because eigh returns ordered eigenvalues.
     ("TwoTensorMap32", 3e-3, TwoTensorMap(D, 32, n_hidden_layers, subkey2), "eigenvalues_perm"),
     ("BaselineMLP32", 3e-3, BaselineMLP(D, 32, n_hidden_layers, subkey3), "componentwise"),
 ]
@@ -365,9 +367,7 @@ for t in range(args.n_trials):
                 ml.EpochStop(epochs=args.epochs, verbose=args.verbose),
                 args.batch,
                 optax.adamw(
-                    optax.cosine_onecycle_schedule(
-                        args.epochs * args.n_train // args.batch, lr, div_factor=3
-                    )
+                    optax.cosine_onecycle_schedule(args.epochs * steps_per_epoch, lr, div_factor=3)
                 ),
                 validation_X=val_X,
                 validation_Y=val_y,
@@ -413,5 +413,7 @@ for t in range(args.n_trials):
         print(f"{t},{model_name}: {results[t,k,2]}")
 
 print(results)
-print("mean over trials", jnp.mean(results, axis=0))
-print("std over trials", jnp.std(results, axis=0))
+
+print("Test Errors")
+for k, (model_name, _, _, _) in enumerate(models_list):
+    print(f"{model_name}: {jnp.mean(results[:, k, 2]):.3e} +- {jnp.std(results[:, k, 2]):.3e}")
