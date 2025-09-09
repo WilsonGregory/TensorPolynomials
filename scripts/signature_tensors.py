@@ -73,57 +73,6 @@ class Baseline(eqx.Module):
         return self.net(x.reshape(-1))
 
 
-def kron_delta_r(k: int) -> list[tuple[int, ...]]:
-    """
-    Generate the distinct permutations of k Kronecker Delta Tensors
-    """
-    assert k % 2 == 0
-    if k == 2:
-        return [(1, 0)]
-    else:
-        seqs = kron_delta_r(k - 2)
-        ls = []
-        for seq in seqs:
-            for idx in range(len(seq) + 1):
-                ls.append((k - 1,) + seq[:idx] + (k - 2,) + seq[idx:])
-
-        return ls
-
-
-def final_permutations(k: int, remaining_k: int, n_initial: int = 0) -> list[tuple[int, ...]]:
-    all_permutations = []
-    for positions in it.combinations(range(n_initial, k + n_initial), remaining_k):
-        seq = list(range(n_initial))
-
-        remaining_k_ls = list(reversed(range(n_initial, n_initial + remaining_k)))
-        kron_delta_ls = list(reversed(range(n_initial + remaining_k, n_initial + k)))
-        for idx in range(n_initial, n_initial + k):
-            seq.append(remaining_k_ls.pop() if idx in positions else kron_delta_ls.pop())
-
-        all_permutations.append(tuple(seq))
-
-    return all_permutations
-
-
-def B(k: int) -> int:
-    assert k % 2 == 0
-    return math.factorial(k) // (math.factorial(k // 2) * (2 ** (k // 2)))
-
-
-def kron_delta_basis_size(total_k: int, n: int) -> int:
-    total = 0
-    for k in range(2, total_k + 1):
-        for j in range(k // 2):
-            n_kron_deltas = j + 1
-            total += (
-                B(2 * n_kron_deltas)
-                * (n ** (k - 2 * n_kron_deltas))
-                * math.comb(k, 2 * n_kron_deltas)
-            )
-
-    return total
-
-
 class EquivSignature(eqx.Module):
 
     net: eqx.nn.MLP
@@ -148,7 +97,7 @@ class EquivSignature(eqx.Module):
 
         n_in = steps + steps * (steps - 1) // 2
         n_out = sum([steps**k for k in range(1, 1 + max_k)])
-        n_out += kron_delta_basis_size(max_k, steps)
+        n_out += utils.metric_tensor_basis_size(max_k, steps)
 
         self.net = eqx.nn.MLP(n_in, n_out, width, depth, jax.nn.gelu, key=key)
 
@@ -187,7 +136,10 @@ class EquivSignature(eqx.Module):
                 kron_delta_product = jnp.einsum(ein_str, *tensor_inputs)
                 # I might want to store this
                 permuted_kron_deltas = jnp.stack(
-                    [kron_delta_product.transpose(idxs) for idxs in kron_delta_r(n_kron_deltas * 2)]
+                    [
+                        kron_delta_product.transpose(idxs)
+                        for idxs in utils.metric_tensor_r(n_kron_deltas * 2)
+                    ]
                 )
 
                 kron_delta_basis = jnp.einsum(
@@ -200,7 +152,7 @@ class EquivSignature(eqx.Module):
                 kron_delta_basis = jnp.stack(
                     [
                         kron_delta_basis.transpose(idxs)
-                        for idxs in final_permutations(k, remaining_k, 1)
+                        for idxs in utils.final_permutations(k, remaining_k, 1)
                     ]
                 ).reshape((-1,) + (D,) * k)
                 basis = jnp.concatenate([basis, kron_delta_basis])
