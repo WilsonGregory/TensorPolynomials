@@ -101,13 +101,14 @@ class EquivSignature(eqx.Module):
 
         n_in = steps + steps * (steps - 1) // 2
         n_out = sum([steps**k for k in range(1, 1 + max_k)])
-        n_out = n_out + 1 if max_k >= 2 else n_out
+        n_out += utils.metric_tensor_basis_size(max_k, steps)
 
         self.net = eqx.nn.MLP(n_in, n_out, width, depth, jax.nn.gelu, key=key)
 
     def __call__(self: Self, x: jax.Array) -> jax.Array:
         n, D = x.shape
 
+        # the metric tensor for the Lorentz group
         id = jnp.eye(D)
         id = id.at[0, 0].set(-1)
 
@@ -118,13 +119,47 @@ class EquivSignature(eqx.Module):
 
         out = jnp.zeros(0)
         idx = 0
+        kth_basis = {0: jnp.ones(1)}  # used for k >=2 when kronecker delta gets involved
         for k in range(1, 1 + self.max_k):
+            # n^k basis elements of the input vectors k-way tensor product (order matters)
             ein_str = ",".join([f"{utils.LETTERS[i] + utils.LETTERS[i+13]}" for i in range(k)])
             ein_str += f"->{utils.LETTERS[:k] + utils.LETTERS[13:13+k]}"
             tensor_inputs = (x,) * k
             basis = jnp.einsum(ein_str, *tensor_inputs).reshape((n**k,) + (D,) * k)
-            if k == 2:
-                basis = jnp.concatenate([basis, jnp.eye(D)[None]])
+            kth_basis[k] = basis
+
+            # now include the basis elements which have at least one metric tensor
+            for j in range(k // 2):
+                # the metric tensor is invariant under the group
+                n_metric_tensor = j + 1
+                remaining_k = k - n_metric_tensor * 2
+
+                # first get tensor product of n_metric_tensor
+                ein_str = ",".join([f"{utils.LETTERS[2*i:2*i+2]}" for i in range(n_metric_tensor)])
+                tensor_inputs = (id,) * n_metric_tensor
+                id_product = jnp.einsum(ein_str, *tensor_inputs)
+                # I might want to store this
+                permuted_metric_tensors = jnp.stack(
+                    [
+                        id_product.transpose(idxs)
+                        for idxs in utils.metric_tensor_r(n_metric_tensor * 2)
+                    ]
+                )
+
+                metric_tensor_basis = jnp.einsum(
+                    f"Y{utils.LETTERS[:remaining_k]},Z{utils.LETTERS[remaining_k:k]}->YZ{utils.LETTERS[:k]}",
+                    kth_basis[remaining_k],
+                    permuted_metric_tensors,
+                ).reshape((-1,) + (D,) * k)
+
+                # do the final permutations, mixing the remaining_k axes with the kron_delta axes
+                metric_tensor_basis = jnp.stack(
+                    [
+                        metric_tensor_basis.transpose(idxs)
+                        for idxs in utils.final_permutations(k, remaining_k, 1)
+                    ]
+                ).reshape((-1,) + (D,) * k)
+                basis = jnp.concatenate([basis, metric_tensor_basis])
 
             collapsed_basis = basis.reshape((len(basis), D**k))
             coeffs = all_coeffs[idx : idx + len(basis)]
@@ -224,9 +259,10 @@ train_X, train_Y, val_X, val_Y, test_X, test_Y = get_data(
 
 key, subkey1, subkey2, subkey3, subkey4 = random.split(key, num=5)
 models_list = [
-    ("tensor_poly", 5e-4, True, EquivSignature(sig_order, steps, 32, 3, subkey2)),
+    # previous model `tensor_poly` didn't include full basis
+    ("tensor_poly32", 5e-4, True, EquivSignature(sig_order, steps, 32, 3, subkey2)),
     ("baseline_samewidth", 5e-3, True, Baseline(D, sig_order, steps, 32, 3, subkey4)),
-    ("baseline_sameparams", 1e-3, True, Baseline(D, sig_order, steps, 128, 3, subkey3)),
+    ("baseline_sameparams116", 1e-3, True, Baseline(D, sig_order, steps, 116, 3, subkey3)),
     ("signax_only", 1, True, SignaxOnly(sig_order)),
 ]
 

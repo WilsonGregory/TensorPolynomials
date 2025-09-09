@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import itertools as it
 
@@ -225,3 +226,54 @@ class PermInvariantTensor:
             print(f"shape: {cls.basis_dict[(k,n,symmetric_axes)].shape}")
 
         return cls.basis_dict[(k, n, symmetric_axes)]
+
+
+def metric_tensor_r(k: int) -> list[tuple[int, ...]]:
+    """
+    Generate the distinct permutations of k metric tensors
+    """
+    assert k % 2 == 0
+    if k == 2:
+        return [(1, 0)]
+    else:
+        seqs = metric_tensor_r(k - 2)
+        ls = []
+        for seq in seqs:
+            for idx in range(len(seq) + 1):
+                ls.append((k - 1,) + seq[:idx] + (k - 2,) + seq[idx:])
+
+        return ls
+
+
+def final_permutations(k: int, remaining_k: int, n_initial: int = 0) -> list[tuple[int, ...]]:
+    all_permutations = []
+    for positions in it.combinations(range(n_initial, k + n_initial), remaining_k):
+        seq = list(range(n_initial))
+
+        remaining_k_ls = list(reversed(range(n_initial, n_initial + remaining_k)))
+        kron_delta_ls = list(reversed(range(n_initial + remaining_k, n_initial + k)))
+        for idx in range(n_initial, n_initial + k):
+            seq.append(remaining_k_ls.pop() if idx in positions else kron_delta_ls.pop())
+
+        all_permutations.append(tuple(seq))
+
+    return all_permutations
+
+
+def B(k: int) -> int:
+    assert k % 2 == 0
+    return math.factorial(k) // (math.factorial(k // 2) * (2 ** (k // 2)))
+
+
+def metric_tensor_basis_size(total_k: int, n: int) -> int:
+    total = 0
+    for k in range(2, total_k + 1):
+        for j in range(k // 2):
+            n_metric_tensor = j + 1
+            total += (
+                B(2 * n_metric_tensor)
+                * (n ** (k - 2 * n_metric_tensor))
+                * math.comb(k, 2 * n_metric_tensor)
+            )
+
+    return total
