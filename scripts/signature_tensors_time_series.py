@@ -93,6 +93,7 @@ def get_data(
     n_val: int,
     n_test: int,
     symmetry_breakers: str | None,
+    one_hot_labels: bool = True,
 ) -> tuple[
     jax.Array,
     jax.Array,
@@ -107,7 +108,7 @@ def get_data(
     D = 3
     # data shape (batch,1,steps), labels shape (batch,)
     x, labels, meta_data = load_classification("UWaveGestureLibraryX", return_metadata=True)
-    labels = jnp.array(labels.astype(int))
+    labels = jnp.array(labels.astype(int))  # (b,)
     y, _ = load_classification("UWaveGestureLibraryY")
     z, _ = load_classification("UWaveGestureLibraryZ")
     assert isinstance(x, np.ndarray) and isinstance(y, np.ndarray) and isinstance(z, np.ndarray)
@@ -127,6 +128,10 @@ def get_data(
         mean_length = jnp.mean(jnp.linalg.norm(sample_points, axis=-1))  # scale them to match
         directional_vectors = jnp.full((batch, D, D), jnp.eye(D)[None] * mean_length)
         sample_points = jnp.concatenate([sample_points, directional_vectors], axis=1)
+
+    if one_hot_labels:
+        # convert to one hot encoded labels, shape (b,8)
+        labels = jnp.stack([(labels == i).astype(float) for i in jnp.unique(labels)], axis=-1)
 
     start = 0
     stop = n_train
@@ -489,7 +494,51 @@ def map_and_loss(
     normalizer: Normalizer | None = None,
 ) -> tuple[jax.Array, eqx.nn.State | None]:
     """
+    Map and loss that optionally unnormalizes the data to compare between models with different
+    normalization schemes.
 
+    args:
+        model:
+        x: input data, shape (batch,steps,D)
+        y: output data, shape (batch, sum_k=1^K: D**k)
+        aux_data: auxilliary data used in the model layers like batch norm
+        normalizer: object to unnormalize the output so all losses are on the same scale
+    """
+    batch, _, D = x.shape
+    assert callable(model)
+    pred_signature_flat = jax.vmap(model)(x)
+
+    if normalizer is not None:
+        pred_signature_flat = normalizer.inverse_output(pred_signature_flat)
+        y = normalizer.inverse_output(y)
+
+    pred_signature = expand_signature(D, pred_signature_flat)
+    y_signature = expand_signature(D, y)
+
+    loss_per_tensor = jnp.zeros((batch, 0))
+    for pred_tensor, y_tensor in zip(pred_signature, y_signature):
+        pred_tensor, y_tensor = pred_tensor.reshape((batch, -1)), y_tensor.reshape((batch, -1))
+        loss_per_tensor = jnp.concatenate(
+            [
+                loss_per_tensor,
+                jnp.mean((pred_tensor - y_tensor) ** 2, axis=1, keepdims=True),
+            ],
+            axis=1,
+        )
+
+    # mean over batch and tensor types. And previously we had mean over tensor entries, so there
+    # error in the 1-tensor is balanced with the error in the 2-tensor.
+    return jnp.mean(loss_per_tensor), aux_data
+
+
+def map_and_loss_return_map(
+    model: eqx.Module,
+    x: jax.Array,
+    y: jax.Array,
+    aux_data: eqx.nn.State | None,
+    normalizer: Normalizer | None = None,
+) -> tuple[jax.Array, eqx.nn.State | None, jax.Array]:
+    """
     args:
         model:
         x: input data, shape (batch,steps,D)
@@ -519,7 +568,73 @@ def map_and_loss(
 
     # mean over batch and tensor types. And previously we had mean over tensor entries, so there
     # error in the 1-tensor is balanced with the error in the 2-tensor.
-    return jnp.mean(loss_per_tensor), aux_data
+    return jnp.mean(loss_per_tensor), aux_data, pred_signature_flat
+
+
+class SignatureClassifier(eqx.Module):
+
+    net: eqx.nn.Linear
+
+    D: int
+    max_k: int
+    n_classes: int
+    n_in: int
+
+    def __init__(self: Self, D: int, max_k: int, n_classes: int, key: jax.Array) -> None:
+        self.D = D
+        self.max_k = max_k
+        self.n_classes = n_classes
+        self.n_in = sum([D**k for k in range(1, max_k + 1)])
+
+        # since the path signature is a universal feature map, there is a linear functional
+        # from the path signature to any function.
+        self.net = eqx.nn.Linear(self.n_in, self.n_classes, use_bias=False, key=key)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return self.net(x)
+
+
+def map_and_loss_classifier(
+    model: eqx.Module,
+    x: jax.Array,
+    y: jax.Array,
+    aux_data: eqx.nn.State | None,
+    normalizer: Normalizer | None = None,
+) -> tuple[jax.Array, eqx.nn.State | None]:
+    """
+    args:
+        model:
+        x: input data, shape (batch,steps,D)
+        y: output data, shape (batch, sum_k=1^K: D**k)
+    """
+    assert callable(model)
+    pred_y = jax.vmap(model)(x)
+
+    if normalizer is not None:
+        pred_y = normalizer.inverse_output(pred_y)
+        y = normalizer.inverse_output(y)
+
+    loss = optax.losses.safe_softmax_cross_entropy(pred_y, y)
+
+    return jnp.mean(loss), aux_data
+
+
+def classifier_misclass_loss(
+    model: eqx.Module,
+    x: jax.Array,
+    y: jax.Array,
+    aux_data: eqx.nn.State | None,
+) -> tuple[jax.Array, eqx.nn.State | None]:
+    """
+    Misclassification, so smaller values are better.
+    args:
+        model:
+        x: input data, shape (batch,sum_k=1^K: D**k)
+        y: output data, shape (batch,n_classes)
+    """
+    assert callable(model)
+    pred_y = jax.vmap(model)(x)
+    return jnp.mean(jnp.argmax(pred_y, axis=1) != jnp.argmax(y, axis=1)), aux_data
 
 
 def handleArgs(argv):
@@ -575,15 +690,18 @@ args = handleArgs(sys.argv)
 D = 3
 
 key = random.PRNGKey(time.time_ns() if args.seed is None else args.seed)
-train_X, train_Y, _, val_X, val_Y, _, test_X, test_Y, _ = get_data(
-    args.sig_order,
-    args.steps,
-    args.n_train,
-    args.n_val,
-    args.n_test,
-    args.symmetry_breakers,
+train_X, train_sig, train_labels, val_X, val_sig, val_labels, test_X, test_sig, test_labels = (
+    get_data(
+        args.sig_order,
+        args.steps,
+        args.n_train,
+        args.n_val,
+        args.n_test,
+        args.symmetry_breakers,
+    )
 )
 n_vecs = args.steps + D if args.symmetry_breakers == SYMMETRY_BREAKERS_FULL else args.steps
+_, n_classes = train_labels.shape
 
 key, subkey1, subkey2, subkey3, subkey4 = random.split(key, num=5)
 models_list = [
@@ -625,7 +743,9 @@ for t in range(args.n_trials):
         save_model = f"{args.save_model}/{name}.eqx" if args.save_model is not None else None
 
         train_X_norm, val_X_norm, test_X_norm = normalizer.input(train_X, val_X, test_X)
-        train_Y_norm, val_Y_norm, test_Y_norm = normalizer.output(train_Y, train_X, val_Y, test_Y)
+        train_sig_norm, val_sig_norm, test_sig_norm = normalizer.output(
+            train_sig, train_X, val_sig, test_sig
+        )
 
         if args.load_model:
             trained_model = ml.load(f"{args.load_model}/{name}.eqx", model)
@@ -654,18 +774,17 @@ for t in range(args.n_trials):
             key, subkey = random.split(key)
             trained_model, _, _, _ = ml.train(
                 train_X_norm,
-                train_Y_norm,
+                train_sig_norm,
                 map_and_loss,
                 model,
                 subkey,
                 ml.ValLoss(patience=50, max_epochs=args.epochs, verbose=args.verbose),
-                # ml.EpochStop(epochs=args.epochs, verbose=args.verbose),
                 args.batch,
                 optax.adamw(
                     optax.cosine_onecycle_schedule(args.epochs * steps_per_epoch, lr, div_factor=3)
                 ),
                 validation_X=val_X_norm,
-                validation_Y=val_Y_norm,
+                validation_Y=val_sig_norm,
                 val_map_and_loss=ft.partial(map_and_loss, normalizer=normalizer),
                 save_model=save_model,
                 is_wandb=args.wandb,
@@ -678,34 +797,72 @@ for t in range(args.n_trials):
                 ml.save(save_model, trained_model)
 
         key, subkey1, subkey2, subkey3 = random.split(key, num=4)
-        results[t, k, 0] = ml.map_loss_in_batches(
-            ft.partial(map_and_loss, normalizer=normalizer),
+        results[t, k, 0], pred_train_sig = ml.map_loss_in_batches(
+            ft.partial(map_and_loss_return_map, normalizer=normalizer),
             trained_model,
             train_X_norm,
-            train_Y_norm,
+            train_sig_norm,
             args.batch,
             subkey1,
             devices=jax.devices(),
+            return_map=True,
         )
-        results[t, k, 1] = ml.map_loss_in_batches(
-            ft.partial(map_and_loss, normalizer=normalizer),
+        results[t, k, 1], pred_val_sig = ml.map_loss_in_batches(
+            ft.partial(map_and_loss_return_map, normalizer=normalizer),
             trained_model,
             val_X_norm,
-            val_Y_norm,
+            val_sig_norm,
             args.batch,
             subkey1,
             devices=jax.devices(),
+            return_map=True,
         )
-        results[t, k, 2] = ml.map_loss_in_batches(
-            ft.partial(map_and_loss, normalizer=normalizer),
+        results[t, k, 2], pred_test_sig = ml.map_loss_in_batches(
+            ft.partial(map_and_loss_return_map, normalizer=normalizer),
             trained_model,
             test_X_norm,
-            test_Y_norm,
+            test_sig_norm,
             args.batch,
             subkey1,
             devices=jax.devices(),
+            return_map=True,
         )
         print(f"{t},{model_name}: {results[t,k,2]}")
+
+        key, subkey = random.split(key)
+        signature_classifier = SignatureClassifier(D, args.sig_order, n_classes, subkey)
+
+        steps_per_epoch = int(args.n_train / args.batch)
+        key, subkey = random.split(key)
+        trained_model, _, _, _ = ml.train(
+            pred_train_sig,
+            train_labels,
+            map_and_loss_classifier,
+            signature_classifier,
+            subkey,
+            # ml.EpochStop(epochs=100, verbose=2),
+            ml.ValLoss(patience=50, max_epochs=args.epochs, verbose=args.verbose),
+            args.batch,
+            optax.adamw(
+                optax.cosine_onecycle_schedule(args.epochs * steps_per_epoch, 1e-3, div_factor=3)
+            ),
+            validation_X=pred_val_sig,
+            validation_Y=val_labels,
+            val_map_and_loss=classifier_misclass_loss,
+        )
+
+        key, subkey = random.split(key)
+        val_loss = ml.map_loss_in_batches(
+            classifier_misclass_loss,
+            trained_model,
+            pred_val_sig,
+            val_labels,
+            args.batch,
+            subkey,
+            devices=jax.devices(),
+        )
+        print("Val accuracy:", 1 - val_loss)
+
 
 print("Test Errors")
 for k, (model_name, _, _, _) in enumerate(models_list):
