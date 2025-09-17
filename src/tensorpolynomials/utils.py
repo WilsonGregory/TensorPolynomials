@@ -277,3 +277,65 @@ def metric_tensor_basis_size(total_k: int, n: int) -> int:
             )
 
     return total
+
+
+def get_tensor_basis_of_vecs(x: jax.Array, max_k: int, metric_tensor: jax.Array):
+    """
+    Construct the set of tensors that span the space of a function from vectors to tensors for
+    orders 1 to max_k inclusive.
+
+    args:
+        x: the input vectors, shape (n,D) for n vectors, D dimensions
+        max_k: highest tensor order inclusive for the basis
+        metric_tensor: basis includes the invariant 2-tensor
+
+    returns:
+        dict of k -> basis, shape (basis_size, (D,)*k)
+    """
+    n, D = x.shape
+    kth_basis_full = {}
+    kth_basis = {0: jnp.ones(1)}  # basis of input tensors, already includes permutations
+    for k in range(1, 1 + max_k):
+        ein_str = ",".join([f"{LETTERS[i] + LETTERS[i+13]}" for i in range(k)])
+        ein_str += f"->{LETTERS[:k] + LETTERS[13:13+k]}"
+        tensor_inputs = (x,) * k
+        basis = jnp.einsum(ein_str, *tensor_inputs).reshape((n**k,) + (D,) * k)
+        kth_basis[k] = basis
+
+        # loop over possible metric tensors
+        for j in range(k // 2):
+            n_metric_tensors = j + 1
+            remaining_k = k - n_metric_tensors * 2
+
+            # first get tensor product of n_metric_tensors
+            ein_str = ",".join([f"{LETTERS[2*i:2*i+2]}" for i in range(n_metric_tensors)])
+            tensor_inputs = (metric_tensor,) * n_metric_tensors
+            metric_tensor_product = jnp.einsum(ein_str, *tensor_inputs)
+
+            # Now get the distinct permutations of the metric tensor product.
+            permuted_metric_tensor = jnp.stack(
+                [
+                    metric_tensor_product.transpose(idxs)
+                    for idxs in metric_tensor_r(n_metric_tensors * 2)
+                ]
+            )
+
+            # basis of elements that include at least one metric tensor
+            metric_tensor_basis = jnp.einsum(
+                f"Y{LETTERS[:remaining_k]},Z{LETTERS[remaining_k:k]}->YZ{LETTERS[:k]}",
+                kth_basis[remaining_k],
+                permuted_metric_tensor,
+            ).reshape((-1,) + (D,) * k)
+
+            # do the final permutations, mixing the remaining_k axes with the kron_delta axes
+            metric_tensor_basis = jnp.stack(
+                [
+                    metric_tensor_basis.transpose(idxs)
+                    for idxs in final_permutations(k, remaining_k, 1)
+                ]
+            ).reshape((-1,) + (D,) * k)
+            basis = jnp.concatenate([basis, metric_tensor_basis])
+
+        kth_basis_full[k] = basis
+
+    return kth_basis_full
