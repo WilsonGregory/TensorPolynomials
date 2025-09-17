@@ -252,12 +252,13 @@ class TrainLoss(StopCondition):
 class ValLoss(StopCondition):
     # Stop when the validation error stops improving after patience number of epochs.
 
-    def __init__(self, patience=0, min_delta=0, verbose=0) -> None:
+    def __init__(self, patience=0, min_delta=0, max_epochs=jnp.inf, verbose=0) -> None:
         super(ValLoss, self).__init__(verbose=verbose)
         self.patience = patience
         self.min_delta = min_delta
         self.best_val_loss = jnp.inf
         self.epochs_since_best = 0
+        self.max_epochs = max_epochs
 
     def stop(self, model, current_epoch, train_loss, val_loss, batch_time) -> bool:
         if val_loss is None:
@@ -275,7 +276,7 @@ class ValLoss(StopCondition):
             if self.verbose >= 2:
                 self.log_status(current_epoch, train_loss, val_loss, batch_time)
 
-        return self.epochs_since_best > self.patience
+        return (self.epochs_since_best > self.patience) or (current_epoch >= self.max_epochs)
 
 
 def save(filename, model):

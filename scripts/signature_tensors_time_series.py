@@ -1,3 +1,5 @@
+import functools as ft
+import math
 import sys
 import time
 import numpy as np
@@ -90,9 +92,6 @@ def get_data(
     n_train: int,
     n_val: int,
     n_test: int,
-    normalize: str,
-    C: float,
-    a: int,
     symmetry_breakers: str | None,
 ) -> tuple[
     jax.Array,
@@ -114,37 +113,15 @@ def get_data(
     assert isinstance(x, np.ndarray) and isinstance(y, np.ndarray) and isinstance(z, np.ndarray)
 
     curves = jnp.moveaxis(jnp.concatenate([x, y, z], axis=1), 1, 2)  # (b,D,steps) -> (b,steps,D)
+    curves -= curves[:, :1]  # path signature moves each path to begin at 0, so maybe we should too?
 
     batch, steps, _ = curves.shape
     assert n_train + n_val + n_test < len(curves)
 
-    if "input" in normalize:
-        curves /= jnp.std(jnp.linalg.norm(curves[:n_train], axis=-1))
-
-    signature = signax.signature(curves, sig_order, flatten=False)
-
-    if "output" in normalize:
-        normalized_sig = [
-            t / jnp.std(jnp.linalg.norm(t[:n_train].reshape((n_train, -1)), axis=-1))
-            for t in signature
-        ]
-    elif "Chevyrev-Oberhauser" in normalize:
-        normalized_sig = lambda_norm(signature, C, a)
-    else:
-        normalized_sig = signature
-
-    normalized_sig = jnp.concatenate([t.reshape((batch, -1)) for t in normalized_sig], axis=1)
+    signature_flat = signax.signature(curves, sig_order, flatten=True)
 
     # (b,sub_steps,D)
     sample_points = curves[:, :: (steps // subsample_steps)][:, :subsample_steps]
-
-    # have to do this after subsampling because otherwise we run out of memory
-    if "gram" in normalize:
-        # (b,steps,steps)
-        X = jnp.einsum("...ij,...kj->...ik", sample_points[:n_train], sample_points[:n_train])
-        X = X[:, jnp.triu_indices(steps)].reshape((n_train, -1))  # (b,gram matrix dim)
-        # sqrt of std because we are applying it to each vector
-        sample_points /= jnp.sqrt(jnp.std(X))
 
     if symmetry_breakers == SYMMETRY_BREAKERS_FULL:
         mean_length = jnp.mean(jnp.linalg.norm(sample_points, axis=-1))  # scale them to match
@@ -154,19 +131,19 @@ def get_data(
     start = 0
     stop = n_train
     train_X = sample_points[start:stop]
-    train_Y = normalized_sig[start:stop]
+    train_Y = signature_flat[start:stop]
     train_labels = labels[start:stop]
 
     start = n_train
     stop = n_train + n_val
     val_X = sample_points[start:stop]
-    val_Y = normalized_sig[start:stop]
+    val_Y = signature_flat[start:stop]
     val_labels = labels[start:stop]
 
     start = n_train + n_val
     stop = n_train + n_val + n_test
     test_X = sample_points[start:stop]
-    test_Y = normalized_sig[start:stop]
+    test_Y = signature_flat[start:stop]
     test_labels = labels[start:stop]
 
     return train_X, train_Y, train_labels, val_X, val_Y, val_labels, test_X, test_Y, test_labels
@@ -204,6 +181,8 @@ class Baseline(eqx.Module):
         n_in = steps * D
         n_out = sum([D**k for k in range(1, 1 + max_k)])
 
+        # default parameter initialization. I tested kaiming initialization which helps train
+        # loss, but hurts the validation loss (overfitting).
         self.net = eqx.nn.MLP(n_in, n_out, width, depth, jax.nn.gelu, key=key)
 
     def __call__(self: Self, x: jax.Array) -> jax.Array:
@@ -255,53 +234,251 @@ class EquivSignature(eqx.Module):
 
         out = jnp.zeros(0)
         idx = 0
-        kth_basis = {0: jnp.ones(1)}  # used for k >=2 when kronecker delta gets involved
+        kth_basis = utils.get_tensor_basis_of_vecs(x, self.max_k, jnp.eye(D))
+
         for k in range(1, 1 + self.max_k):
-            ein_str = ",".join([f"{utils.LETTERS[i] + utils.LETTERS[i+13]}" for i in range(k)])
-            ein_str += f"->{utils.LETTERS[:k] + utils.LETTERS[13:13+k]}"
-            tensor_inputs = (x,) * k
-            basis = jnp.einsum(ein_str, *tensor_inputs).reshape((n**k,) + (D,) * k)
-            kth_basis[k] = basis
-
-            for j in range(k // 2):
-                n_kron_deltas = j + 1
-                remaining_k = k - n_kron_deltas * 2
-
-                # first get tensor product of n_kron_deltas
-                ein_str = ",".join([f"{utils.LETTERS[2*i:2*i+2]}" for i in range(n_kron_deltas)])
-                tensor_inputs = (jnp.eye(D),) * n_kron_deltas
-                kron_delta_product = jnp.einsum(ein_str, *tensor_inputs)
-                # I might want to store this
-                permuted_kron_deltas = jnp.stack(
-                    [
-                        kron_delta_product.transpose(idxs)
-                        for idxs in utils.metric_tensor_r(n_kron_deltas * 2)
-                    ]
-                )
-
-                kron_delta_basis = jnp.einsum(
-                    f"Y{utils.LETTERS[:remaining_k]},Z{utils.LETTERS[remaining_k:k]}->YZ{utils.LETTERS[:k]}",
-                    kth_basis[remaining_k],
-                    permuted_kron_deltas,
-                ).reshape((-1,) + (D,) * k)
-
-                # do the final permutations, mixing the remaining_k axes with the kron_delta axes
-                kron_delta_basis = jnp.stack(
-                    [
-                        kron_delta_basis.transpose(idxs)
-                        for idxs in utils.final_permutations(k, remaining_k, 1)
-                    ]
-                ).reshape((-1,) + (D,) * k)
-                basis = jnp.concatenate([basis, kron_delta_basis])
-
-            collapsed_basis = basis.reshape((len(basis), D**k))
-            coeffs = all_coeffs[idx : idx + len(basis)]
+            collapsed_basis = kth_basis[k].reshape((-1, D**k))
+            coeffs = all_coeffs[idx : idx + len(collapsed_basis)]
             out = jnp.concatenate([out, coeffs @ collapsed_basis])
-            idx += len(basis)
+            idx += len(collapsed_basis)
 
         assert idx == len(all_coeffs)
 
         return out
+
+
+def expand_signature(D: int, signature_flat: jax.Array) -> list[jax.Array]:
+    """
+    Given a flat signature, expand it into list form. Signature starts at k=1
+
+    args:
+        signature_flat: shape (batch,flat_signature)
+    """
+    idx = 0
+    k = 1
+    signature = []
+    while idx < signature_flat.shape[1]:
+        signature.append(signature_flat[:, idx : idx + D**k].reshape((-1,) + (D,) * k))
+        idx += D**k
+        k += 1
+
+    assert idx == signature_flat.shape[1]
+
+    return signature
+
+
+class Normalizer:
+
+    INPUT_TYPES = ["norm", "gram", "standard"]
+    OUTPUT_TYPES = ["norm", "Chevyrev-Oberhauser", "align_basis", "standard"]
+
+    D: int
+    input_type: str | None
+    output_type: str | None
+    n_train: int
+    input_scale: jax.Array | float
+    output_scale: jax.Array
+
+    # constants used for Chevyrev-Oberhauser
+    C: int
+    a: int
+
+    def __init__(
+        self: Self,
+        D: int,
+        input_type: str | None,
+        output_type: str | None,
+        n_train: int,
+        C: int,
+        a: int,
+    ) -> None:
+        self.D = D
+        self.input_type = input_type
+        self.output_type = output_type
+        self.n_train = n_train
+        self.C = C
+        self.a = a
+
+    def input(self: Self, vectors: jax.Array, *extra_vectors: jax.Array) -> tuple[jax.Array, ...]:
+        """
+        Normalize the input vectors.
+
+        args:
+            vectors: input train vectors, shape (batch,steps,D)
+            extra_vectors: input vectors for the test or validation set, normalize based on train set
+        """
+        if self.input_type == "norm":
+            self.input_scale = jnp.std(jnp.linalg.norm(vectors), axis=-1)
+        elif self.input_type == "gram":
+            _, steps, _ = vectors.shape
+
+            # (b,steps,steps)
+            X = jnp.einsum("...ij,...kj->...ik", vectors, vectors)
+            X = X[:, jnp.triu_indices(steps)].reshape((self.n_train, -1))  # (b,gram matrix dim)
+            # sqrt of std because we are applying it to each vector
+            self.input_scale = jnp.sqrt(jnp.std(X))
+        elif self.input_type == "standard":
+            # this won't get inverted, but if we are doing loss differences it shouldn't matter
+            vec_mean = jnp.mean(vectors)
+            vectors -= vec_mean
+            extra_vectors = tuple(vecs - vec_mean for vecs in extra_vectors)
+            self.input_scale = jnp.std(vectors)
+        elif self.input_type is None:
+            self.input_scale = 1
+        else:
+            raise ValueError
+
+        return vectors / self.input_scale, *[vecs / self.input_scale for vecs in extra_vectors]
+
+    def inverse_input(self: Self, vectors: jax.Array) -> jax.Array:
+        return vectors * self.input_scale
+
+    def output(
+        self: Self,
+        signature_flat: jax.Array,
+        vectors: jax.Array | None,
+        *extra_signatures_flat: jax.Array,
+    ) -> tuple[jax.Array, ...]:
+        """
+        Normalize the path signature in list form.
+
+        args:
+            flat_signature: list of jax arrays of shape (batch, (D,)*k)
+        """
+        extra_signatures = [
+            expand_signature(self.D, sig_flat) for sig_flat in extra_signatures_flat
+        ]
+        if self.output_type == "standard":
+            # this won't get inverted, but if we are doing loss differences it shouldn't matter
+            sig_mean = jnp.mean(signature_flat)
+            signature_flat -= sig_mean
+            extra_signatures_flat = tuple(
+                extra_sig - sig_mean for extra_sig in extra_signatures_flat
+            )
+
+            signature = expand_signature(self.D, signature_flat)
+            self.output_scale = jnp.ones(len(signature)) * jnp.std(signature_flat)
+        else:
+            signature = expand_signature(self.D, signature_flat)
+
+        if self.output_type == "Chevyrev-Oberhauser":
+            # currently cant inverse this one, so just return here
+            scaled_signature = lambda_norm(signature, self.C, self.a)
+            scaled_signature_flat = jnp.concatenate(
+                [t.reshape((len(t), -1)) for t in scaled_signature], axis=-1
+            )
+
+            scaled_extra_sigs_flat = []
+            for extra_signature in extra_signatures:
+                scaled_extra_signature = lambda_norm(extra_signature, self.C, self.a)
+                scaled_extra_sigs_flat.append(
+                    jnp.concatenate(
+                        [t.reshape((len(t), -1)) for t in scaled_extra_signature], axis=-1
+                    )
+                )
+            return scaled_signature_flat, *scaled_extra_sigs_flat
+
+        if self.output_type == "norm":
+            self.output_scale = jnp.stack(
+                [
+                    jnp.std(jnp.linalg.norm(t[: self.n_train].reshape((self.n_train, -1)), axis=-1))
+                    for t in signature
+                ]
+            )
+        elif self.output_type == "align_basis":
+            assert vectors is not None
+            # scale the output tensors so that the standard deviations of their norm match
+            # the standard deviation of the norm of the basis elements
+            vmap_tensor_basis = jax.vmap(utils.get_tensor_basis_of_vecs, in_axes=(0, None, None))
+            kth_basis = vmap_tensor_basis(vectors[: self.n_train], len(signature), jnp.eye(D))
+
+            output_scale = []
+            for k, t, basis_t in zip(range(1, len(signature) + 1), signature, kth_basis.values()):
+                std_basis = jnp.std(jnp.linalg.norm(basis_t.reshape((-1, D**k)), axis=-1))
+                std_t = jnp.std(
+                    jnp.linalg.norm(t[: self.n_train].reshape((self.n_train, -1)), axis=-1)
+                )
+                output_scale.append(std_t / std_basis)
+
+                # testing the normalization wrt the weights initialization
+                # key = random.PRNGKey(time.time_ns())
+                # key, subkey = random.split(key)
+                # batch, width = 10000, 100
+                # x = random.normal(subkey, shape=(batch, width))
+                # print(jnp.mean(jnp.std(x, axis=0)))
+
+                # def uniform_init(weight: jax.Array, key) -> jax.Array:
+                #     out, in_ = weight.shape
+                #     gain = math.sqrt(2)  # gain for ReLU
+                #     lim = math.sqrt(3 / in_) * gain
+                #     return jax.random.uniform(key, shape=(out, in_), minval=-lim, maxval=lim)
+
+                # def init_linear_weight(model, init_fn, key):
+                #     is_linear = lambda x: isinstance(x, eqx.nn.Linear)
+                #     get_weights = lambda m: [
+                #         x.weight
+                #         for x in jax.tree_util.tree_leaves(m, is_leaf=is_linear)
+                #         if is_linear(x)
+                #     ]
+                #     weights = get_weights(model)
+                #     new_weights = [
+                #         init_fn(weight, subkey)
+                #         for weight, subkey in zip(weights, jax.random.split(key, len(weights)))
+                #     ]
+                #     new_model = eqx.tree_at(get_weights, model, new_weights)
+                #     return new_model
+
+                # for depth in range(20):
+                #     key, subkey = random.split(key)
+                #     mlp_raw = eqx.nn.MLP(
+                #         width, len(basis_t), width, depth, activation=jax.nn.gelu, key=subkey
+                #     )
+
+                #     key, subkey = random.split(key)
+                #     mlp = init_linear_weight(mlp_raw, uniform_init, subkey)
+
+                #     out_x = jax.vmap(mlp)(x)
+
+                #     # since these are coefficients that we are adding together, get the std over
+                #     # the batch of the sum of the coefficients
+                #     print(
+                #         f"{depth:02d} {jnp.mean(jnp.std(out_x, axis=0)):.5f} {jnp.std(jnp.mean(out_x, axis=1)):.5f}"
+                #     )
+
+                #     # print(depth, jnp.mean(jnp.std(out_x, axis=0))) # mean std of the output nodes
+                #     # print(jnp.std(out_x, axis=0))
+
+                # exit()
+
+            self.output_scale = jnp.stack(output_scale)
+        elif self.output_type is None:
+            self.output_scale = jnp.ones(len(signature))
+        elif self.output_type == "standard":
+            pass  # implemented above
+        else:
+            raise ValueError
+
+        scaled_signature = [t / t_scale for t, t_scale in zip(signature, self.output_scale)]
+        scaled_signature_flat = jnp.concatenate(
+            [t.reshape((len(t), -1)) for t in scaled_signature], axis=-1
+        )
+
+        # scale the extra signatures, then flatten them
+        scaled_extra_sigs_flat = []
+        for extra_signature in extra_signatures:
+            scaled_extra_signature = [
+                t / t_scale for t, t_scale in zip(extra_signature, self.output_scale)
+            ]
+            scaled_extra_sigs_flat.append(
+                jnp.concatenate([t.reshape((len(t), -1)) for t in scaled_extra_signature], axis=-1)
+            )
+
+        return scaled_signature_flat, *scaled_extra_sigs_flat
+
+    def inverse_output(self: Self, signature_flat: jax.Array) -> jax.Array:
+        signature = expand_signature(self.D, signature_flat)
+        scaled_signature = [t * t_scale for t, t_scale in zip(signature, self.output_scale)]
+        return jnp.concatenate([t.reshape((len(t), -1)) for t in scaled_signature], axis=-1)
 
 
 def map_and_loss(
@@ -309,6 +486,7 @@ def map_and_loss(
     x: jax.Array,
     y: jax.Array,
     aux_data: eqx.nn.State | None,
+    normalizer: Normalizer | None = None,
 ) -> tuple[jax.Array, eqx.nn.State | None]:
     """
 
@@ -319,66 +497,29 @@ def map_and_loss(
     """
     batch, _, D = x.shape
     assert callable(model)
-    pred_signature = jax.vmap(model)(x)
+    pred_signature_flat = jax.vmap(model)(x)
 
-    idx = 0
-    k = 1
+    if normalizer is not None:
+        pred_signature_flat = normalizer.inverse_output(pred_signature_flat)
+        y = normalizer.inverse_output(y)
+
+    pred_signature = expand_signature(D, pred_signature_flat)
+    y_signature = expand_signature(D, y)
+
     loss_per_tensor = jnp.zeros((batch, 0))
-    while idx < y.shape[1]:
-        pred_flat_tensor = pred_signature[:, idx : idx + D**k]
-        y_flat_tensor = y[:, idx : idx + D**k]
+    for pred_tensor, y_tensor in zip(pred_signature, y_signature):
+        pred_tensor, y_tensor = pred_tensor.reshape((batch, -1)), y_tensor.reshape((batch, -1))
         loss_per_tensor = jnp.concatenate(
             [
                 loss_per_tensor,
-                jnp.mean((pred_flat_tensor - y_flat_tensor) ** 2, axis=1, keepdims=True),
+                jnp.mean((pred_tensor - y_tensor) ** 2, axis=1, keepdims=True),
             ],
             axis=1,
         )
-        idx += D**k
-        k += 1
 
-    assert idx == y.shape[1]
     # mean over batch and tensor types. And previously we had mean over tensor entries, so there
     # error in the 1-tensor is balanced with the error in the 2-tensor.
     return jnp.mean(loss_per_tensor), aux_data
-
-
-def map_and_loss_return_map(
-    model: eqx.Module,
-    x: jax.Array,
-    y: jax.Array,
-    aux_data: eqx.nn.State | None,
-) -> tuple[jax.Array, eqx.nn.State | None, jax.Array]:
-    """
-    args:
-        model:
-        x: input data, shape (batch,steps,D)
-        y: output data, shape (batch, sum_k=1^K: D**k)
-    """
-    batch, _, D = x.shape
-    assert callable(model)
-    pred_signature = jax.vmap(model)(x)
-
-    idx = 0
-    k = 1
-    loss_per_tensor = jnp.zeros((batch, 0))
-    while idx < y.shape[1]:
-        pred_flat_tensor = pred_signature[:, idx : idx + D**k]
-        y_flat_tensor = y[:, idx : idx + D**k]
-        loss_per_tensor = jnp.concatenate(
-            [
-                loss_per_tensor,
-                jnp.mean((pred_flat_tensor - y_flat_tensor) ** 2, axis=1, keepdims=True),
-            ],
-            axis=1,
-        )
-        idx += D**k
-        k += 1
-
-    assert idx == y.shape[1]
-    # mean over batch and tensor types. And previously we had mean over tensor entries, so there
-    # error in the 1-tensor is balanced with the error in the 2-tensor.
-    return jnp.mean(loss_per_tensor), aux_data, pred_signature
 
 
 def handleArgs(argv):
@@ -399,20 +540,6 @@ def handleArgs(argv):
     )
     parser.add_argument(
         "-v", "--verbose", help="verbose argument passed to trainer", type=int, default=1
-    )
-    parser.add_argument(
-        "--normalize",
-        help="normalize input data, equivariantly",
-        type=str,
-        choices=[
-            "input",
-            "output",
-            "input_and_output",
-            "gram_and_output",
-            "Chevyrev-Oberhauser",
-            "input_and_Chevyrev-Oberhauser",
-        ],
-        default="input",
     )
     parser.add_argument("-C", help="parameter for C-O normalization", type=float, default=1000)
     parser.add_argument("-a", help="parameter for C-O normalization", type=int, default=1)
@@ -454,109 +581,130 @@ train_X, train_Y, _, val_X, val_Y, _, test_X, test_Y, _ = get_data(
     args.n_train,
     args.n_val,
     args.n_test,
-    args.normalize,
-    args.C,
-    args.a,
     args.symmetry_breakers,
 )
 n_vecs = args.steps + D if args.symmetry_breakers == SYMMETRY_BREAKERS_FULL else args.steps
 
 key, subkey1, subkey2, subkey3, subkey4 = random.split(key, num=5)
 models_list = [
-    # ("signax_only", 1, True, SignaxOnly(args.sig_order)),
-    ("tensor_poly", 5e-4, True, EquivSignature(args.sig_order, n_vecs, 32, 3, False, subkey1)),
-    # ("baseline_samewidth", 5e-3, True, Baseline(D, args.sig_order, n_vecs, 32, 3, subkey4)),
-    # ("baseline_sameparams", 1e-3, True, Baseline(D, args.sig_order, n_vecs, 128, 3, subkey3)),
+    (
+        "signax_only",
+        1,
+        SignaxOnly(args.sig_order),
+        Normalizer(D, None, None, args.n_train, args.C, args.a),
+    ),
+    (
+        "tensor_poly",
+        1e-4,
+        EquivSignature(args.sig_order, n_vecs, 32, 3, False, subkey1),
+        Normalizer(D, "gram", "align_basis", args.n_train, args.C, args.a),
+    ),
+    (
+        "baseline_samewidth",
+        5e-3,
+        Baseline(D, args.sig_order, n_vecs, 32, 3, subkey4),
+        Normalizer(D, "standard", "standard", args.n_train, args.C, args.a),
+    ),
+    (
+        "baseline_sameparams",
+        1e-3,
+        Baseline(D, args.sig_order, n_vecs, 128, 3, subkey3),
+        Normalizer(D, "standard", "standard", args.n_train, args.C, args.a),
+    ),
 ]
 
 results = np.zeros((args.n_trials, len(models_list), 3))
 for t in range(args.n_trials):
-    for k, (model_name, lr, needs_training, model) in enumerate(models_list):
+    for k, (model_name, lr, model, normalizer) in enumerate(models_list):
+        # TODO: I need to check that the typical sum of basis elements times the coefficients
+        # also has similar standard deviation of norms
 
         print(f"{model_name}: {count_params(model):,} params")
 
         name = f"signature_{model_name}_t{t}_lr{lr}_e{args.epochs}_ntrain{args.n_train}"
         save_model = f"{args.save_model}/{name}.eqx" if args.save_model is not None else None
 
-        if needs_training:
-            if args.load_model:
-                trained_model = ml.load(f"{args.load_model}/{name}.eqx", model)
-            else:
-                if args.wandb:
-                    wandb.init(
-                        project=args.wandb_project,
-                        entity=args.wandb_entity,  # what is this?
-                        name=name,
-                        settings=wandb.Settings(start_method="fork"),
-                    )
-                    wandb.config.update(args)
-                    wandb.config.update(
-                        {
-                            "trial": t,
-                            "model_name": model_name,
-                            "lr": lr,
-                        }
-                    )
+        train_X_norm, val_X_norm, test_X_norm = normalizer.input(train_X, val_X, test_X)
+        train_Y_norm, val_Y_norm, test_Y_norm = normalizer.output(train_Y, train_X, val_Y, test_Y)
 
-                steps_per_epoch = int(args.n_train / args.batch)
-                key, subkey = random.split(key)
-                trained_model, _, _, _ = ml.train(
-                    train_X,
-                    train_Y,
-                    map_and_loss,
-                    model,
-                    subkey,
-                    ml.EpochStop(epochs=args.epochs, verbose=args.verbose),
-                    args.batch,
-                    optax.adamw(
-                        optax.cosine_onecycle_schedule(
-                            args.epochs * steps_per_epoch, lr, div_factor=3
-                        )
-                    ),
-                    validation_X=val_X,
-                    validation_Y=val_Y,
-                    save_model=save_model,
-                    is_wandb=args.wandb,
+        if args.load_model:
+            trained_model = ml.load(f"{args.load_model}/{name}.eqx", model)
+        else:
+            if args.wandb:
+                wandb.init(
+                    project=args.wandb_project,
+                    entity=args.wandb_entity,  # what is this?
+                    name=name,
+                    settings=wandb.Settings(start_method="fork"),
+                )
+                wandb.config.update(args)
+                wandb.config.update(
+                    {
+                        "trial": t,
+                        "model_name": model_name,
+                        "lr": lr,
+                        "normalize_input": normalizer.input_type,
+                        "normalize_output": normalizer.output_type,
+                    }
                 )
 
-                if args.wandb:
-                    wandb.finish()
+            steps_per_epoch = int(args.n_train / args.batch)
 
-                if args.save_model is not None:
-                    ml.save(save_model, trained_model)
-        else:
-            trained_model = model
+            # normalizer values will be set for val set, not train
+            key, subkey = random.split(key)
+            trained_model, _, _, _ = ml.train(
+                train_X_norm,
+                train_Y_norm,
+                map_and_loss,
+                model,
+                subkey,
+                ml.ValLoss(patience=50, max_epochs=args.epochs, verbose=args.verbose),
+                # ml.EpochStop(epochs=args.epochs, verbose=args.verbose),
+                args.batch,
+                optax.adamw(
+                    optax.cosine_onecycle_schedule(args.epochs * steps_per_epoch, lr, div_factor=3)
+                ),
+                validation_X=val_X_norm,
+                validation_Y=val_Y_norm,
+                val_map_and_loss=ft.partial(map_and_loss, normalizer=normalizer),
+                save_model=save_model,
+                is_wandb=args.wandb,
+            )
+
+            if args.wandb:
+                wandb.finish()
+
+            if args.save_model is not None:
+                ml.save(save_model, trained_model)
 
         key, subkey1, subkey2, subkey3 = random.split(key, num=4)
         results[t, k, 0] = ml.map_loss_in_batches(
-            map_and_loss,
+            ft.partial(map_and_loss, normalizer=normalizer),
             trained_model,
-            train_X,
-            train_Y,
+            train_X_norm,
+            train_Y_norm,
             args.batch,
             subkey1,
             devices=jax.devices(),
         )
         results[t, k, 1] = ml.map_loss_in_batches(
-            map_and_loss,
+            ft.partial(map_and_loss, normalizer=normalizer),
             trained_model,
-            val_X,
-            val_Y,
+            val_X_norm,
+            val_Y_norm,
             args.batch,
             subkey1,
             devices=jax.devices(),
         )
-        test_loss, pred_test_y = ml.map_loss_in_batches(
-            map_and_loss_return_map,
+        results[t, k, 2] = ml.map_loss_in_batches(
+            ft.partial(map_and_loss, normalizer=normalizer),
             trained_model,
-            test_X,
-            test_Y,
+            test_X_norm,
+            test_Y_norm,
             args.batch,
             subkey1,
             devices=jax.devices(),
-            return_map=True,
         )
-        results[t, k, 2] = test_loss
         print(f"{t},{model_name}: {results[t,k,2]}")
 
 print("Test Errors")
