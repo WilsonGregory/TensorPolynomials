@@ -242,7 +242,8 @@ class EquivSignature(eqx.Module):
         kth_basis = utils.get_tensor_basis_of_vecs(x, self.max_k, jnp.eye(D))
 
         for k in range(1, 1 + self.max_k):
-            collapsed_basis = kth_basis[k].reshape((-1, D**k))
+            # scale basis elements so they have close to unit norm
+            collapsed_basis = kth_basis[k].reshape((-1, D**k)) / ((D ** (k / 2)) * (k**2))
             coeffs = all_coeffs[idx : idx + len(collapsed_basis)]
             out = jnp.concatenate([out, coeffs @ collapsed_basis])
             idx += len(collapsed_basis)
@@ -315,11 +316,11 @@ class Normalizer:
         if self.input_type == "norm":
             self.input_scale = jnp.std(jnp.linalg.norm(vectors), axis=-1)
         elif self.input_type == "gram":
-            _, steps, _ = vectors.shape
+            batch, steps, _ = vectors.shape
 
             # (b,steps,steps)
             X = jnp.einsum("...ij,...kj->...ik", vectors, vectors)
-            X = X[:, jnp.triu_indices(steps)].reshape((self.n_train, -1))  # (b,gram matrix dim)
+            X = X[:, jnp.triu_indices(steps)].reshape((batch, -1))  # (b,gram matrix dim)
             # sqrt of std because we are applying it to each vector
             self.input_scale = jnp.sqrt(jnp.std(X))
         elif self.input_type == "standard":
@@ -386,7 +387,7 @@ class Normalizer:
         if self.output_type == "norm":
             self.output_scale = jnp.stack(
                 [
-                    jnp.std(jnp.linalg.norm(t[: self.n_train].reshape((self.n_train, -1)), axis=-1))
+                    jnp.std(jnp.linalg.norm(t.reshape((self.n_train, -1)), axis=-1))
                     for t in signature
                 ]
             )
@@ -395,67 +396,23 @@ class Normalizer:
             # scale the output tensors so that the standard deviations of their norm match
             # the standard deviation of the norm of the basis elements
             vmap_tensor_basis = jax.vmap(utils.get_tensor_basis_of_vecs, in_axes=(0, None, None))
-            kth_basis = vmap_tensor_basis(vectors[: self.n_train], len(signature), jnp.eye(D))
+            kth_basis = vmap_tensor_basis(vectors, len(signature), jnp.eye(D))
 
             output_scale = []
             for k, t, basis_t in zip(range(1, len(signature) + 1), signature, kth_basis.values()):
                 std_basis = jnp.std(jnp.linalg.norm(basis_t.reshape((-1, D**k)), axis=-1))
-                std_t = jnp.std(
-                    jnp.linalg.norm(t[: self.n_train].reshape((self.n_train, -1)), axis=-1)
-                )
+                std_t = jnp.std(jnp.linalg.norm(t.reshape((self.n_train, -1)), axis=-1))
                 output_scale.append(std_t / std_basis)
 
-                # testing the normalization wrt the weights initialization
-                # key = random.PRNGKey(time.time_ns())
-                # key, subkey = random.split(key)
-                # batch, width = 10000, 100
-                # x = random.normal(subkey, shape=(batch, width))
-                # print(jnp.mean(jnp.std(x, axis=0)))
-
-                # def uniform_init(weight: jax.Array, key) -> jax.Array:
-                #     out, in_ = weight.shape
-                #     gain = math.sqrt(2)  # gain for ReLU
-                #     lim = math.sqrt(3 / in_) * gain
-                #     return jax.random.uniform(key, shape=(out, in_), minval=-lim, maxval=lim)
-
-                # def init_linear_weight(model, init_fn, key):
-                #     is_linear = lambda x: isinstance(x, eqx.nn.Linear)
-                #     get_weights = lambda m: [
-                #         x.weight
-                #         for x in jax.tree_util.tree_leaves(m, is_leaf=is_linear)
-                #         if is_linear(x)
-                #     ]
-                #     weights = get_weights(model)
-                #     new_weights = [
-                #         init_fn(weight, subkey)
-                #         for weight, subkey in zip(weights, jax.random.split(key, len(weights)))
-                #     ]
-                #     new_model = eqx.tree_at(get_weights, model, new_weights)
-                #     return new_model
-
-                # for depth in range(20):
-                #     key, subkey = random.split(key)
-                #     mlp_raw = eqx.nn.MLP(
-                #         width, len(basis_t), width, depth, activation=jax.nn.gelu, key=subkey
-                #     )
-
-                #     key, subkey = random.split(key)
-                #     mlp = init_linear_weight(mlp_raw, uniform_init, subkey)
-
-                #     out_x = jax.vmap(mlp)(x)
-
-                #     # since these are coefficients that we are adding together, get the std over
-                #     # the batch of the sum of the coefficients
-                #     print(
-                #         f"{depth:02d} {jnp.mean(jnp.std(out_x, axis=0)):.5f} {jnp.std(jnp.mean(out_x, axis=1)):.5f}"
-                #     )
-
-                #     # print(depth, jnp.mean(jnp.std(out_x, axis=0))) # mean std of the output nodes
-                #     # print(jnp.std(out_x, axis=0))
-
-                # exit()
-
             self.output_scale = jnp.stack(output_scale)
+        elif self.output_type == "mean_norm":
+            # scale the tensor signatures so that their expected norm is 1.
+            self.output_scale = jnp.stack(
+                [
+                    jnp.mean(jnp.linalg.norm(t.reshape((self.n_train, -1)), axis=-1))
+                    for t in signature
+                ]
+            )
         elif self.output_type is None:
             self.output_scale = jnp.ones(len(signature))
         elif self.output_type == "standard":
@@ -715,7 +672,7 @@ models_list = [
         "tensor_poly",
         1e-4,
         EquivSignature(args.sig_order, n_vecs, 32, 3, False, subkey1),
-        Normalizer(D, "gram", "align_basis", args.n_train, args.C, args.a),
+        Normalizer(D, "gram", "mean_norm", args.n_train, args.C, args.a),
     ),
     (
         "baseline_samewidth",
@@ -744,7 +701,7 @@ for t in range(args.n_trials):
 
         train_X_norm, val_X_norm, test_X_norm = normalizer.input(train_X, val_X, test_X)
         train_sig_norm, val_sig_norm, test_sig_norm = normalizer.output(
-            train_sig, train_X, val_sig, test_sig
+            train_sig, train_X_norm, val_sig, test_sig
         )
 
         if args.load_model:
