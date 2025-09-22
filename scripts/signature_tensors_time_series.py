@@ -276,7 +276,7 @@ def expand_signature(D: int, signature_flat: jax.Array) -> list[jax.Array]:
 class Normalizer:
 
     INPUT_TYPES = ["norm", "gram", "standard"]
-    OUTPUT_TYPES = ["norm", "Chevyrev-Oberhauser", "align_basis", "standard"]
+    OUTPUT_TYPES = ["norm", "Chevyrev-Oberhauser", "align_basis", "mean_norm", "standard"]
 
     D: int
     input_type: str | None
@@ -551,6 +551,45 @@ class SignatureClassifier(eqx.Module):
         return self.net(x)
 
 
+class BaselinePathClassifier(eqx.Module):
+
+    net: eqx.nn.MLP
+
+    def __init__(
+        self: Self, D: int, steps: int, n_classes: int, width: int, depth: int, key: jax.Array
+    ) -> None:
+        self.net = eqx.nn.MLP(D * steps, n_classes, width, depth, activation=jax.nn.gelu, key=key)
+
+    def __call__(self: Self, x: jax.Array) -> jax.Array:
+        return self.net(x.reshape(-1))
+
+
+class EquivSigPathClassifier(eqx.Module):
+    """
+    End to end version of the path classifier which calculates an intermediate path signature.
+    """
+
+    signature_model: EquivSignature
+    linear_classifer: SignatureClassifier
+
+    def __init__(
+        self: Self,
+        D: int,
+        max_k: int,
+        steps: int,
+        width: int,
+        depth: int,
+        n_classes: int,
+        key: jax.Array,
+    ) -> None:
+        key, subkey1, subkey2 = random.split(key, num=3)
+        self.signature_model = EquivSignature(max_k, steps, width, depth, False, subkey1)
+        self.linear_classifer = SignatureClassifier(D, max_k, n_classes, subkey2)
+
+    def __call__(self: Self, x: jax.Array) -> jax.Array:
+        return self.linear_classifer(self.signature_model(x))
+
+
 def map_and_loss_classifier(
     model: eqx.Module,
     x: jax.Array,
@@ -662,37 +701,70 @@ _, n_classes = train_labels.shape
 
 key, subkey1, subkey2, subkey3, subkey4 = random.split(key, num=5)
 models_list = [
+    # (
+    #     "signax_only",
+    #     1,
+    #     SignaxOnly(args.sig_order),
+    #     Normalizer(D, None, None, args.n_train, args.C, args.a),
+    #     False,
+    # ),
+    # (
+    #     "tensor_poly",
+    #     1e-4,
+    #     EquivSignature(args.sig_order, n_vecs, 32, 3, False, subkey1),
+    #     Normalizer(D, "gram", "mean_norm", args.n_train, args.C, args.a),
+    #     False,
+    # ),
+    # (
+    #     "baseline_samewidth",
+    #     5e-3,
+    #     Baseline(D, args.sig_order, n_vecs, 32, 3, subkey4),
+    #     Normalizer(D, "standard", "standard", args.n_train, args.C, args.a),
+    #     False,
+    # ),
+    # (
+    #     "baseline_sameparams",
+    #     1e-3,
+    #     Baseline(D, args.sig_order, n_vecs, 128, 3, subkey3),
+    #     Normalizer(D, "standard", "standard", args.n_train, args.C, args.a),
+    #     False,
+    # ),
     (
-        "signax_only",
-        1,
-        SignaxOnly(args.sig_order),
-        Normalizer(D, None, None, args.n_train, args.C, args.a),
+        "tensor_poly_e2e",
+        1e-3,  # for 128 (symmetry-breakers and not), it looks like 8e-3
+        EquivSigPathClassifier(D, args.sig_order, n_vecs, 32, 3, n_classes, subkey1),
+        Normalizer(D, "gram", None, args.n_train, args.C, args.a),
+        True,
     ),
     (
-        "tensor_poly",
-        1e-4,
-        EquivSignature(args.sig_order, n_vecs, 32, 3, False, subkey1),
-        Normalizer(D, "gram", "mean_norm", args.n_train, args.C, args.a),
-    ),
-    (
-        "baseline_samewidth",
-        5e-3,
-        Baseline(D, args.sig_order, n_vecs, 32, 3, subkey4),
-        Normalizer(D, "standard", "standard", args.n_train, args.C, args.a),
-    ),
-    (
-        "baseline_sameparams",
+        "baseline_e2e",
         1e-3,
-        Baseline(D, args.sig_order, n_vecs, 128, 3, subkey3),
-        Normalizer(D, "standard", "standard", args.n_train, args.C, args.a),
+        BaselinePathClassifier(D, n_vecs, n_classes, 32, 4, key=subkey2),
+        Normalizer(D, "standard", None, args.n_train, args.C, args.a),
+        True,
     ),
 ]
+# lrs = jnp.concatenate([jnp.arange(1, 10) * 1e-4, jnp.arange(1, 10) * 1e-3])
+# models_list = ft.reduce(
+#     lambda x, y: x + y,
+#     [
+#         [
+#             (
+#                 "baseline_e2e",
+#                 lr,
+#                 BaselinePathClassifier(D, n_vecs, n_classes, 112, 4, key=subkey2),
+#                 Normalizer(D, "standard", None, args.n_train, args.C, args.a),
+#                 True,
+#             ),
+#         ]
+#         for lr in lrs
+#     ],
+#     [],
+# )
 
 results = np.zeros((args.n_trials, len(models_list), 3))
 for t in range(args.n_trials):
-    for k, (model_name, lr, model, normalizer) in enumerate(models_list):
-        # TODO: I need to check that the typical sum of basis elements times the coefficients
-        # also has similar standard deviation of norms
+    for k, (model_name, lr, model, normalizer, end_to_end) in enumerate(models_list):
 
         print(f"{model_name}: {count_params(model):,} params")
 
@@ -709,7 +781,7 @@ for t in range(args.n_trials):
         else:
             if args.wandb:
                 wandb.init(
-                    project=args.wandb_project,
+                    project=args.wandb_project + ("-classify" if end_to_end else ""),
                     entity=args.wandb_entity,  # what is this?
                     name=name,
                     settings=wandb.Settings(start_method="fork"),
@@ -731,18 +803,22 @@ for t in range(args.n_trials):
             key, subkey = random.split(key)
             trained_model, _, _, _ = ml.train(
                 train_X_norm,
-                train_sig_norm,
-                map_and_loss,
+                train_labels if end_to_end else train_sig_norm,
+                map_and_loss_classifier if end_to_end else map_and_loss,
                 model,
                 subkey,
-                ml.ValLoss(patience=50, max_epochs=args.epochs, verbose=args.verbose),
+                ml.ValLoss(patience=100, max_epochs=args.epochs, verbose=args.verbose),
                 args.batch,
                 optax.adamw(
                     optax.cosine_onecycle_schedule(args.epochs * steps_per_epoch, lr, div_factor=3)
                 ),
                 validation_X=val_X_norm,
-                validation_Y=val_sig_norm,
-                val_map_and_loss=ft.partial(map_and_loss, normalizer=normalizer),
+                validation_Y=val_labels if end_to_end else val_sig_norm,
+                val_map_and_loss=(
+                    classifier_misclass_loss
+                    if end_to_end
+                    else ft.partial(map_and_loss, normalizer=normalizer)
+                ),
                 save_model=save_model,
                 is_wandb=args.wandb,
             )
@@ -753,74 +829,117 @@ for t in range(args.n_trials):
             if args.save_model is not None:
                 ml.save(save_model, trained_model)
 
-        key, subkey1, subkey2, subkey3 = random.split(key, num=4)
-        results[t, k, 0], pred_train_sig = ml.map_loss_in_batches(
-            ft.partial(map_and_loss_return_map, normalizer=normalizer),
-            trained_model,
-            train_X_norm,
-            train_sig_norm,
-            args.batch,
-            subkey1,
-            devices=jax.devices(),
-            return_map=True,
-        )
-        results[t, k, 1], pred_val_sig = ml.map_loss_in_batches(
-            ft.partial(map_and_loss_return_map, normalizer=normalizer),
-            trained_model,
-            val_X_norm,
-            val_sig_norm,
-            args.batch,
-            subkey1,
-            devices=jax.devices(),
-            return_map=True,
-        )
-        results[t, k, 2], pred_test_sig = ml.map_loss_in_batches(
-            ft.partial(map_and_loss_return_map, normalizer=normalizer),
-            trained_model,
-            test_X_norm,
-            test_sig_norm,
-            args.batch,
-            subkey1,
-            devices=jax.devices(),
-            return_map=True,
-        )
-        print(f"{t},{model_name}: {results[t,k,2]}")
+        if end_to_end:
+            trained_classifier = trained_model
 
-        key, subkey = random.split(key)
-        signature_classifier = SignatureClassifier(D, args.sig_order, n_classes, subkey)
+            key, subkey = random.split(key)
+            results[t, k, 0] = 1 - ml.map_loss_in_batches(
+                classifier_misclass_loss,
+                trained_classifier,
+                train_X_norm,
+                train_labels,
+                args.batch,
+                subkey,
+                devices=jax.devices(),
+            )
 
-        steps_per_epoch = int(args.n_train / args.batch)
-        key, subkey = random.split(key)
-        trained_model, _, _, _ = ml.train(
-            pred_train_sig,
-            train_labels,
-            map_and_loss_classifier,
-            signature_classifier,
-            subkey,
-            # ml.EpochStop(epochs=100, verbose=2),
-            ml.ValLoss(patience=50, max_epochs=args.epochs, verbose=args.verbose),
-            args.batch,
-            optax.adamw(
-                optax.cosine_onecycle_schedule(args.epochs * steps_per_epoch, 1e-3, div_factor=3)
-            ),
-            validation_X=pred_val_sig,
-            validation_Y=val_labels,
-            val_map_and_loss=classifier_misclass_loss,
-        )
+            key, subkey = random.split(key)
+            results[t, k, 1] = 1 - ml.map_loss_in_batches(
+                classifier_misclass_loss,
+                trained_classifier,
+                val_X_norm,
+                val_labels,
+                args.batch,
+                subkey,
+                devices=jax.devices(),
+            )
+            print("Val accuracy:", results[t, k, 1])
 
-        key, subkey = random.split(key)
-        val_loss = ml.map_loss_in_batches(
-            classifier_misclass_loss,
-            trained_model,
-            pred_val_sig,
-            val_labels,
-            args.batch,
-            subkey,
-            devices=jax.devices(),
-        )
-        print("Val accuracy:", 1 - val_loss)
+            key, subkey = random.split(key)
+            results[t, k, 2] = 1 - ml.map_loss_in_batches(
+                classifier_misclass_loss,
+                trained_classifier,
+                test_X_norm,
+                test_labels,
+                args.batch,
+                subkey,
+                devices=jax.devices(),
+            )
+            print("Test accuracy:", results[t, k, 2])
+        else:
+            key, subkey1, subkey2, subkey3 = random.split(key, num=4)
+            results[t, k, 0], pred_train_sig = ml.map_loss_in_batches(
+                ft.partial(map_and_loss_return_map, normalizer=normalizer),
+                trained_model,
+                train_X_norm,
+                train_sig_norm,
+                args.batch,
+                subkey1,
+                devices=jax.devices(),
+                return_map=True,
+            )
+            results[t, k, 1], pred_val_sig = ml.map_loss_in_batches(
+                ft.partial(map_and_loss_return_map, normalizer=normalizer),
+                trained_model,
+                val_X_norm,
+                val_sig_norm,
+                args.batch,
+                subkey1,
+                devices=jax.devices(),
+                return_map=True,
+            )
+            results[t, k, 2], pred_test_sig = ml.map_loss_in_batches(
+                ft.partial(map_and_loss_return_map, normalizer=normalizer),
+                trained_model,
+                test_X_norm,
+                test_sig_norm,
+                args.batch,
+                subkey1,
+                devices=jax.devices(),
+                return_map=True,
+            )
+            print(f"{t},{model_name}: {results[t,k,2]}")
 
+            key, subkey = random.split(key)
+            signature_classifier = SignatureClassifier(D, args.sig_order, n_classes, subkey)
+
+            steps_per_epoch = int(args.n_train / args.batch)
+            key, subkey = random.split(key)
+            trained_classifier, _, _, _ = ml.train(
+                pred_train_sig,
+                train_labels,
+                map_and_loss_classifier,
+                signature_classifier,
+                subkey,
+                ml.ValLoss(patience=50, max_epochs=args.epochs, verbose=args.verbose),
+                args.batch,
+                optax.adamw(
+                    optax.cosine_onecycle_schedule(
+                        args.epochs * steps_per_epoch, 1e-3, div_factor=3
+                    )
+                ),
+                validation_X=pred_val_sig,
+                validation_Y=val_labels,
+                val_map_and_loss=classifier_misclass_loss,
+            )
+
+            key, subkey = random.split(key)
+            val_loss = ml.map_loss_in_batches(
+                classifier_misclass_loss,
+                trained_classifier,
+                pred_val_sig,
+                val_labels,
+                args.batch,
+                subkey,
+                devices=jax.devices(),
+            )
+            print("Val accuracy:", 1 - val_loss)
+
+
+print("Val Errors")
+for k, (model_name, _, _, _, _) in enumerate(models_list):
+    print(f"{model_name}: {jnp.mean(results[:, k, 1]):.3e} +- {jnp.std(results[:, k, 1]):.3e}")
 
 print("Test Errors")
-for k, (model_name, _, _, _) in enumerate(models_list):
+for k, (model_name, _, _, _, _) in enumerate(models_list):
     print(f"{model_name}: {jnp.mean(results[:, k, 2]):.3e} +- {jnp.std(results[:, k, 2]):.3e}")
