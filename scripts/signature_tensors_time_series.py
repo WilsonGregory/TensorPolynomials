@@ -141,6 +141,8 @@ def get_data(
         labels[labels == 7] = 4
         labels[labels == 8] = 4
 
+    labels = jnp.array(labels)
+
     if one_hot_labels:
         # convert to one hot encoded labels, shape (b,8)
         labels = jnp.stack([(labels == i).astype(float) for i in jnp.unique(labels)], axis=-1)
