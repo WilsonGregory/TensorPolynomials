@@ -22,6 +22,7 @@ import signax
 from aeon.datasets import load_classification
 
 UWAVE = "UWaveGestureLibrary"
+UWAVE_REDUCED = "UWaveReduced"
 
 SYMMETRY_BREAKERS_FULL = "full"
 
@@ -87,6 +88,7 @@ def lambda_norm(signature: list[jax.Array], C: float, a: int):
 
 
 def get_data(
+    data: str,
     sig_order: int,
     subsample_steps: int,
     n_train: int,
@@ -108,7 +110,7 @@ def get_data(
     D = 3
     # data shape (batch,1,steps), labels shape (batch,)
     x, labels, meta_data = load_classification("UWaveGestureLibraryX", return_metadata=True)
-    labels = jnp.array(labels.astype(int))  # (b,)
+    labels = labels.astype(int)  # (b,) leave it as numpy array for now
     y, _ = load_classification("UWaveGestureLibraryY")
     z, _ = load_classification("UWaveGestureLibraryZ")
     assert isinstance(x, np.ndarray) and isinstance(y, np.ndarray) and isinstance(z, np.ndarray)
@@ -128,6 +130,18 @@ def get_data(
         mean_length = jnp.mean(jnp.linalg.norm(sample_points, axis=-1))  # scale them to match
         directional_vectors = jnp.full((batch, D, D), jnp.eye(D)[None] * mean_length)
         sample_points = jnp.concatenate([sample_points, directional_vectors], axis=1)
+
+    if data == UWAVE_REDUCED:
+        # combine 3,4,5,6 => 3
+        labels[labels == 4] = 3
+        labels[labels == 5] = 3
+        labels[labels == 6] = 3
+
+        # combine 7,8 => 4
+        labels[labels == 7] = 4
+        labels[labels == 8] = 4
+
+    labels = jnp.array(labels)
 
     if one_hot_labels:
         # convert to one hot encoded labels, shape (b,8)
@@ -635,7 +649,13 @@ def classifier_misclass_loss(
 
 def handleArgs(argv):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", help="the name of the dataset", type=str, default=UWAVE)
+    parser.add_argument(
+        "--data",
+        help="the name of the dataset",
+        choices=[UWAVE, UWAVE_REDUCED],
+        type=str,
+        default=UWAVE,
+    )
     parser.add_argument("-e", "--epochs", help="number of epochs to run", type=int, default=50)
     parser.add_argument("--batch", help="batch size", type=int, default=32)
     parser.add_argument("--n-train", help="number of training points", type=int, default=896)
@@ -688,6 +708,7 @@ D = 3
 key = random.PRNGKey(time.time_ns() if args.seed is None else args.seed)
 train_X, train_sig, train_labels, val_X, val_sig, val_labels, test_X, test_sig, test_labels = (
     get_data(
+        args.data,
         args.sig_order,
         args.steps,
         args.n_train,
@@ -744,16 +765,16 @@ models_list = [
         True,
     ),
 ]
-# lrs = jnp.concatenate([jnp.arange(1, 10) * 1e-4, jnp.arange(1, 10) * 1e-3])
+# lrs = jnp.concatenate([jnp.arange(1, 6) * 2e-4, jnp.arange(1, 5) * 2e-3])
 # models_list = ft.reduce(
 #     lambda x, y: x + y,
 #     [
 #         [
 #             (
-#                 "baseline_e2e",
+#                 "tensor_poly_e2e",
 #                 lr,
-#                 BaselinePathClassifier(D, n_vecs, n_classes, 112, 4, key=subkey2),
-#                 Normalizer(D, "standard", None, args.n_train, args.C, args.a),
+#                 EquivSigPathClassifier(D, args.sig_order, n_vecs, 32, 3, n_classes, subkey1),
+#                 Normalizer(D, "gram", None, args.n_train, args.C, args.a),
 #                 True,
 #             ),
 #         ]
