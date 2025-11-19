@@ -16,6 +16,7 @@ import equinox as eqx
 
 import tensorpolynomials.ml as ml
 import tensorpolynomials.utils as utils
+import tensorpolynomials.data as t_data
 
 import signax
 
@@ -267,26 +268,6 @@ class EquivSignature(eqx.Module):
         return out
 
 
-def expand_signature(D: int, signature_flat: jax.Array) -> list[jax.Array]:
-    """
-    Given a flat signature, expand it into list form. Signature starts at k=1
-
-    args:
-        signature_flat: shape (batch,flat_signature)
-    """
-    idx = 0
-    k = 1
-    signature = []
-    while idx < signature_flat.shape[1]:
-        signature.append(signature_flat[:, idx : idx + D**k].reshape((-1,) + (D,) * k))
-        idx += D**k
-        k += 1
-
-    assert idx == signature_flat.shape[1]
-
-    return signature
-
-
 class Normalizer:
 
     INPUT_TYPES = ["norm", "gram", "standard"]
@@ -366,7 +347,7 @@ class Normalizer:
             flat_signature: list of jax arrays of shape (batch, (D,)*k)
         """
         extra_signatures = [
-            expand_signature(self.D, sig_flat) for sig_flat in extra_signatures_flat
+            t_data.expand_signature(self.D, sig_flat) for sig_flat in extra_signatures_flat
         ]
         if self.output_type == "standard":
             # this won't get inverted, but if we are doing loss differences it shouldn't matter
@@ -376,26 +357,20 @@ class Normalizer:
                 extra_sig - sig_mean for extra_sig in extra_signatures_flat
             )
 
-            signature = expand_signature(self.D, signature_flat)
+            signature = t_data.expand_signature(self.D, signature_flat)
             self.output_scale = jnp.ones(len(signature)) * jnp.std(signature_flat)
         else:
-            signature = expand_signature(self.D, signature_flat)
+            signature = t_data.expand_signature(self.D, signature_flat)
 
         if self.output_type == "Chevyrev-Oberhauser":
             # currently cant inverse this one, so just return here
             scaled_signature = lambda_norm(signature, self.C, self.a)
-            scaled_signature_flat = jnp.concatenate(
-                [t.reshape((len(t), -1)) for t in scaled_signature], axis=-1
-            )
+            scaled_signature_flat = t_data.flatten_signature(scaled_signature)
 
             scaled_extra_sigs_flat = []
             for extra_signature in extra_signatures:
                 scaled_extra_signature = lambda_norm(extra_signature, self.C, self.a)
-                scaled_extra_sigs_flat.append(
-                    jnp.concatenate(
-                        [t.reshape((len(t), -1)) for t in scaled_extra_signature], axis=-1
-                    )
-                )
+                scaled_extra_sigs_flat.append(t_data.flatten_signature(scaled_extra_signature))
             return scaled_signature_flat, *scaled_extra_sigs_flat
 
         if self.output_type == "norm":
@@ -435,9 +410,7 @@ class Normalizer:
             raise ValueError
 
         scaled_signature = [t / t_scale for t, t_scale in zip(signature, self.output_scale)]
-        scaled_signature_flat = jnp.concatenate(
-            [t.reshape((len(t), -1)) for t in scaled_signature], axis=-1
-        )
+        scaled_signature_flat = t_data.flatten_signature(scaled_signature)
 
         # scale the extra signatures, then flatten them
         scaled_extra_sigs_flat = []
@@ -445,16 +418,14 @@ class Normalizer:
             scaled_extra_signature = [
                 t / t_scale for t, t_scale in zip(extra_signature, self.output_scale)
             ]
-            scaled_extra_sigs_flat.append(
-                jnp.concatenate([t.reshape((len(t), -1)) for t in scaled_extra_signature], axis=-1)
-            )
+            scaled_extra_sigs_flat.append(t_data.flatten_signature(scaled_extra_signature))
 
         return scaled_signature_flat, *scaled_extra_sigs_flat
 
     def inverse_output(self: Self, signature_flat: jax.Array) -> jax.Array:
-        signature = expand_signature(self.D, signature_flat)
+        signature = t_data.expand_signature(self.D, signature_flat)
         scaled_signature = [t * t_scale for t, t_scale in zip(signature, self.output_scale)]
-        return jnp.concatenate([t.reshape((len(t), -1)) for t in scaled_signature], axis=-1)
+        return t_data.flatten_signature(scaled_signature)
 
 
 def map_and_loss(
@@ -483,8 +454,8 @@ def map_and_loss(
         pred_signature_flat = normalizer.inverse_output(pred_signature_flat)
         y = normalizer.inverse_output(y)
 
-    pred_signature = expand_signature(D, pred_signature_flat)
-    y_signature = expand_signature(D, y)
+    pred_signature = t_data.expand_signature(D, pred_signature_flat)
+    y_signature = t_data.expand_signature(D, y)
 
     loss_per_tensor = jnp.zeros((batch, 0))
     for pred_tensor, y_tensor in zip(pred_signature, y_signature):
@@ -523,8 +494,8 @@ def map_and_loss_return_map(
         pred_signature_flat = normalizer.inverse_output(pred_signature_flat)
         y = normalizer.inverse_output(y)
 
-    pred_signature = expand_signature(D, pred_signature_flat)
-    y_signature = expand_signature(D, y)
+    pred_signature = t_data.expand_signature(D, pred_signature_flat)
+    y_signature = t_data.expand_signature(D, y)
 
     loss_per_tensor = jnp.zeros((batch, 0))
     for pred_tensor, y_tensor in zip(pred_signature, y_signature):

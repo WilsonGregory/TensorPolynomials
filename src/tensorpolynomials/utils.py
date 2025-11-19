@@ -265,9 +265,12 @@ def B(k: int) -> int:
     return math.factorial(k) // (math.factorial(k // 2) * (2 ** (k // 2)))
 
 
-def metric_tensor_basis_size(total_k: int, n: int) -> int:
+def metric_tensor_basis_size(sig_orders: list[int], n: int) -> int:
     total = 0
-    for k in range(2, total_k + 1):
+    for k in sig_orders:
+        if k < 2:
+            continue
+
         for j in range(k // 2):
             n_metric_tensor = j + 1
             total += (
