@@ -222,7 +222,200 @@ def map_and_loss(model, x, y):
 ## Signature Tensor ish
 
 
+def expand_signature(
+    D: int, signature_flat: jax.Array, orders: list[int] | None = None
+) -> dict[int, jax.Array]:
+    """
+    Given a flat signature, expand it into list form. Signature starts at k=1
+
+    args:
+        D: dimension
+        signature_flat: shape (batch,flat_signature)
+    """
+    idx = 0
+    signature = {}
+    if orders is None:  # assume its orders 1...k
+        k = 1
+        while idx < signature_flat.shape[1]:
+            signature[k] = signature_flat[:, idx : idx + D**k].reshape((-1,) + (D,) * k)
+            idx += D**k
+            k += 1
+
+        assert idx == signature_flat.shape[1]
+    else:
+        for k in orders:
+            signature[k] = signature_flat[:, idx : idx + D**k].reshape((-1,) + (D,) * k)
+            idx += D**k
+
+    return signature
+
+
+def flatten_signature(signature: dict[int, jax.Array], batch_dims: int = 1) -> jax.Array:
+    """
+    Given a signature in list form, flatten it into a single array, possibly with leading batch
+    dimensions.
+
+    args:
+        signature: as a list, shape (batch1, ... batchDim,tensor)
+        batch_dims: number of leading batch dimension of each signature element
+
+    return:
+        flattened signature
+    """
+    return jnp.concatenate(
+        [t.reshape(t.shape[:batch_dims] + (-1,)) for t in signature.values()], axis=-1
+    )
+
+
+def get_signature_flat(
+    D: int,
+    n_curves: int,
+    sig_order: int,
+    top_sig_only: bool,
+    steps: int,
+    interval: tuple[int, int],
+    library_params: tuple[str, int],
+    key: ArrayLike,
+    coeffs_dist: str = "uniform",
+    integrator_steps: int = 1000,
+) -> tuple[jax.Array, jax.Array]:
+    curves, signature = get_signature(
+        D,
+        n_curves,
+        sig_order,
+        top_sig_only,
+        steps,
+        interval,
+        library_params,
+        key,
+        coeffs_dist,
+        integrator_steps,
+    )
+    return curves, flatten_signature(signature)
+
+
+def psi(t: jax.Array, i: jax.Array, m: int) -> jax.Array:
+    latter_two = jnp.where(
+        t <= i / m,
+        m * t - (i - 1),
+        jnp.ones_like(t),
+    )
+    assert isinstance(latter_two, jax.Array)
+
+    return jnp.where(t <= (i - 1) / m, jnp.zeros_like(t), latter_two)
+
+
 def get_signature(
+    D: int,
+    n_curves: int,
+    sig_order: int,
+    top_sig_only: int,
+    steps: int,
+    interval: tuple[int, int],
+    library_params: tuple[str, int],
+    key: ArrayLike,
+    coeffs_dist: str = "uniform",
+    integrator_steps: int = 1000,
+) -> tuple[jax.Array, dict[int, jax.Array]]:
+    start, end = interval
+    library_type, degree = library_params
+
+    t = jnp.linspace(start, end, num=steps)  # (steps,))
+
+    # (batch,D,degree)
+    if coeffs_dist == "uniform":
+        coeffs = random.uniform(key, shape=(n_curves, D, degree), minval=-1)
+    elif (
+        coeffs_dist == "normal"
+    ):  # TODO: I suspect these curves are too smooth for us to beat signax
+        coeffs = random.normal(key, shape=(n_curves, D, degree))
+    else:
+        raise ValueError()
+
+    if library_type == "polynomial":
+        library = jnp.stack([t**m for m in range(1, degree + 1)], axis=-1)  # (steps, degree)
+
+        if (sig_order <= 3) and (interval == (0, 1)):
+            C1 = jnp.ones(degree)
+            sig1 = jnp.einsum("bIi,i->bI", coeffs, C1)
+
+            i2 = jnp.full((degree,) * 2, jnp.arange(degree)[:, None] + 1)
+            j2 = jnp.transpose(i2, (1, 0))
+            C2 = j2 / (i2 + j2)
+            sig2 = jnp.einsum("...Ii,...Jj,ij->...IJ", coeffs, coeffs, C2)
+
+            i3 = jnp.full((degree,) * 3, jnp.arange(degree)[:, None, None] + 1)
+            j3 = jnp.transpose(i3, (1, 0, 2))
+            k3 = jnp.transpose(i3, (2, 1, 0))
+            C3 = (j3 / (i3 + j3)) * (k3 / (i3 + j3 + k3))
+            sig3 = jnp.einsum("...Ii,...Jj,...Kk,ijk->...IJK", coeffs, coeffs, coeffs, C3)
+            signature = {1: sig1, 2: sig2, 3: sig3}
+        else:
+            # do it numerically
+            t_integrator = jnp.linspace(start, end, num=integrator_steps)
+            library_integrator = jnp.stack([t_integrator**m for m in range(1, degree + 1)], axis=-1)
+            # (int_steps,degree),(b,D,degree)->(b,int_steps,D)
+            curves_integrator = jnp.einsum("ij,bDj->biD", library_integrator, coeffs)
+            signature_ls = signax.signature(curves_integrator, sig_order, flatten=False)
+            signature = {k: sig for k, sig in zip(range(1, sig_order + 1), signature_ls)}
+
+    elif library_type == "piecewise_linear":
+        library = jax.vmap(psi, in_axes=(None, 0, None), out_axes=1)(
+            t, jnp.arange(1, degree + 1), degree
+        )
+
+        if (sig_order <= 3) and (interval == (0, 1)):
+            # we have exact calculation for this case
+            C1 = jnp.ones(degree)
+            sig1 = jnp.einsum("bIi,i->bI", coeffs, C1)
+
+            # smarter way of doing this no doubt
+            C2 = np.zeros((degree, degree))
+            for i in range(degree):
+                for j in range(degree):
+                    if i < j:
+                        C2[i, j] = 1
+                    elif i == j:
+                        C2[i, j] = 0.5
+                    # else it equals 0
+
+            sig2 = jnp.einsum("...Ii,...Jj,ij->...IJ", coeffs, coeffs, C2)
+
+            # smarter way of doing this no doubt
+            C3 = np.zeros((degree, degree, degree))
+            for i in range(degree):
+                for j in range(degree):
+                    for k in range(degree):
+                        if i < j < k:
+                            C3[i, j, k] = 1
+                        elif (i < j and j == k) or (i == j and j < k):
+                            C3[i, j, k] = 0.5
+                        elif i == j == k:
+                            C3[i, j, k] = 1 / 6
+                        # else it equals 0
+
+            sig3 = jnp.einsum("...Ii,...Jj,...Kk,ijk->...IJK", coeffs, coeffs, coeffs, C3)
+            signature = {1: sig1, 2: sig2, 3: sig3}
+        else:
+            # do it numerically
+            t_integrator = jnp.linspace(start, end, num=integrator_steps)
+            library_integrator = jax.vmap(psi, in_axes=(None, 0, None), out_axes=1)(
+                t_integrator, jnp.arange(1, degree + 1), degree
+            )
+            # (int_steps,degree),(b,D,degree)->(b,int_steps,D)
+            curves_integrator = jnp.einsum("ij,bDj->biD", library_integrator, coeffs)
+            signature_ls = signax.signature(curves_integrator, sig_order, flatten=False)
+            signature = {k: sig for k, sig in zip(range(1, sig_order + 1), signature_ls)}
+
+    else:
+        raise ValueError()
+
+    # (steps,degree),(b,D,steps)->(b,steps,D)
+    curves = jnp.einsum("ij,bDj->biD", library, coeffs)
+    return curves, {sig_order: signature[sig_order]} if top_sig_only else signature
+
+
+def get_signature_old(
     D: int,
     n_curves: int,
     integrator_steps: int,
@@ -231,13 +424,10 @@ def get_signature(
     key: ArrayLike,
 ) -> tuple[jax.Array, jax.Array]:
     t = jnp.linspace(-1, 1, num=integrator_steps)  # (steps,))
-    library = jnp.stack(
-        [jnp.ones(integrator_steps), t, t**2, t**3, t**4, t**5], axis=-1
-    )  # (steps, library)
+    library = jnp.stack([t, t**2, t**3, t**4, t**5], axis=-1)
 
     key, subkey = random.split(key)
     # (batch,library,channels)
-    # coeffs = random.normal(key, shape=(n_curves, library.shape[1], D))
     coeffs = random.uniform(subkey, shape=(n_curves, library.shape[1], D), minval=-1)
     curves = jnp.einsum("ij,bjc->bic", library, coeffs)  # (batch,steps,channels)
 
