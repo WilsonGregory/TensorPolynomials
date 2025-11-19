@@ -37,44 +37,44 @@ def get_data(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, list[int]]:
     subkey1, subkey2, subkey3 = random.split(key, num=3)
 
-    # train_X, train_Y = data.get_signature_old(D, n_train, 1000, sig_order, steps, subkey1)
-    # val_X, val_Y = data.get_signature_old(D, n_val, 1000, sig_order, steps, subkey2)
-    # test_X, test_Y = data.get_signature_old(D, n_test, 1000, sig_order, steps, subkey3)
+    train_X, train_Y = data.get_signature_old(D, n_train, 1000, sig_order, steps, subkey1)
+    val_X, val_Y = data.get_signature_old(D, n_val, 1000, sig_order, steps, subkey2)
+    test_X, test_Y = data.get_signature_old(D, n_test, 1000, sig_order, steps, subkey3)
 
-    library_type = data_type  # for now, may have an option to use the old ones as well
-    train_X, train_Y = data.get_signature_flat(
-        D,
-        n_train,
-        sig_order,
-        top_sig_only,
-        steps,
-        (0, 1),
-        (library_type, data_degree),
-        subkey1,
-        coeffs_dist="uniform",
-    )
-    val_X, val_Y = data.get_signature_flat(
-        D,
-        n_val,
-        sig_order,
-        top_sig_only,
-        steps,
-        (0, 1),
-        (library_type, data_degree),
-        subkey2,
-        coeffs_dist="uniform",
-    )
-    test_X, test_Y = data.get_signature_flat(
-        D,
-        n_test,
-        sig_order,
-        top_sig_only,
-        steps,
-        (0, 1),
-        (library_type, data_degree),
-        subkey3,
-        coeffs_dist="uniform",
-    )
+    # library_type = data_type  # for now, may have an option to use the old ones as well
+    # train_X, train_Y = data.get_signature_flat(
+    #     D,
+    #     n_train,
+    #     sig_order,
+    #     top_sig_only,
+    #     steps,
+    #     (-1, 1),
+    #     (library_type, data_degree),
+    #     subkey1,
+    #     coeffs_dist="uniform",
+    # )
+    # val_X, val_Y = data.get_signature_flat(
+    #     D,
+    #     n_val,
+    #     sig_order,
+    #     top_sig_only,
+    #     steps,
+    #     (-1, 1),
+    #     (library_type, data_degree),
+    #     subkey2,
+    #     coeffs_dist="uniform",
+    # )
+    # test_X, test_Y = data.get_signature_flat(
+    #     D,
+    #     n_test,
+    #     sig_order,
+    #     top_sig_only,
+    #     steps,
+    #     (-1, 1),
+    #     (library_type, data_degree),
+    #     subkey3,
+    #     coeffs_dist="uniform",
+    # )
 
     orders = [sig_order] if top_sig_only else list(range(1, sig_order + 1))
 
