@@ -72,9 +72,8 @@ def normalize_data(
     test_X: jax.Array,
     test_y: jax.Array,
     normalize_type: str,
+    global_y_std: jax.Array,
 ):
-    global_y_std = jnp.std(train_y)
-
     if normalize_type == "componentwise":
         mean_X = jnp.mean(train_X, axis=0, keepdims=True)  # (1,D,D)
         mean_y = jnp.mean(train_y, axis=0, keepdims=True)
@@ -87,8 +86,8 @@ def normalize_data(
         # Subtract a multiple of the identity so that the mean diagonal value is 0
         mean_X = jnp.mean(jnp.diag(jnp.mean(train_X, axis=0))) * jnp.eye(D)[None]
         mean_y = jnp.mean(jnp.diag(jnp.mean(train_y, axis=0))) * jnp.eye(D)[None]
-        std_X = jnp.std(train_X)
-        std_y = jnp.std(train_y)
+        std_X = jnp.std(jnp.linalg.norm(train_X - mean_X, axis=(1, 2)))
+        std_y = jnp.std(jnp.linalg.norm(train_y - mean_y, axis=(1, 2)))
 
         scaler = std_y / global_y_std  # this will be 1
 
@@ -119,6 +118,33 @@ def normalize_data(
     test_y = test_y / std_y
 
     return train_X, train_y, val_X, val_y, test_X, test_y, scaler
+
+
+def augment_data(
+    D: int,
+    data: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+    aug_multiplier: int,
+    key: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    train_X, train_Y, val_X, val_Y, test_X, test_Y = data
+    batch = len(train_X)
+
+    train_X_aug = jnp.full((aug_multiplier,) + train_X.shape, train_X[None])
+    train_X_aug = train_X_aug.reshape((batch * aug_multiplier, D, D))
+
+    train_Y_aug = jnp.full((aug_multiplier,) + train_Y.shape, train_Y[None])
+    train_Y_aug = train_Y_aug.reshape((batch * aug_multiplier, D, D))
+
+    key, subkey = random.split(key)
+    Qs = random.orthogonal(subkey, D, (batch * aug_multiplier,))
+    train_X_aug_rot = jnp.einsum(
+        "...ij,...kl,...jl->...ik", Qs, Qs, train_X_aug, precision=jax.lax.Precision.HIGHEST
+    )
+    train_Y_aug_rot = jnp.einsum(
+        "...ij,...kl,...jl->...ik", Qs, Qs, train_Y_aug, precision=jax.lax.Precision.HIGHEST
+    )
+
+    return train_X_aug_rot, train_Y_aug_rot, val_X, val_Y, test_X, test_Y
 
 
 class CountableModule(eqx.Module):
@@ -307,33 +333,42 @@ data = get_data(
     args.n_val,
     args.n_test,
 )
+global_y_std = jnp.std(data[1])
 
-key, subkey1, subkey2, subkey3 = random.split(key, 4)
+key, subkey1, subkey2, subkey3, subkey4 = random.split(key, num=5)
 models_list = [
     (
         "TwoTensorMapPermEquivariant23",
         1e-3,  # 1e-3 for 20k, 2e-3 for 5k
         TwoTensorMapPermEquivariant(D, width, n_hidden_layers, subkey1),
+        1,
         "eigenvalues_perm",
     ),
     # having trouble reproducing results with the non-permutation equivariant model
     # this model was already "canonicalized" because eigh returns ordered eigenvalues.
-    ("TwoTensorMap32", 3e-3, TwoTensorMap(D, 32, n_hidden_layers, subkey2), "eigenvalues_perm"),
-    ("BaselineMLP32", 3e-3, BaselineMLP(D, 32, n_hidden_layers, subkey3), "componentwise"),
+    ("TwoTensorMap32", 3e-3, TwoTensorMap(D, 32, n_hidden_layers, subkey2), 1, "eigenvalues_perm"),
+    ("BaselineMLP32", 3e-3, BaselineMLP(D, 32, n_hidden_layers, subkey3), 1, "componentwise"),
+    ("BaselineMLP32_aug4", 3e-3, BaselineMLP(D, 32, n_hidden_layers, subkey4), 4, "tensor"),
 ]
 
-for model_name, _, model, _ in models_list:
+for model_name, _, model, _, _ in models_list:
     print(f"{model_name} params: {model.count_params():,}")
 
 results = np.zeros((args.n_trials, len(models_list), 3))
 for t in range(args.n_trials):
-    for k, (model_name, lr, model, normalize_type) in enumerate(models_list):
+    for k, (model_name, lr, model, aug_multiplier, normalize_type) in enumerate(models_list):
+        key, subkey1, subkey2, subkey3, subkey4, subkey5 = random.split(key, num=6)
 
         name = f"materials_{model_name}_t{t}_lr{lr}_e{args.epochs}_ntrain{args.n_train}"
         save_model = f"{args.save_model}/{name}.eqx" if args.save_model is not None else None
 
+        if aug_multiplier > 1:
+            aug_data = augment_data(D, data, aug_multiplier, subkey1)
+        else:
+            aug_data = data
+
         train_X, train_y, val_X, val_y, test_X, test_y, scaler = normalize_data(
-            D, *data, normalize_type
+            D, *aug_data, normalize_type, global_y_std
         )
 
         if args.load_model:
@@ -356,14 +391,13 @@ for t in range(args.n_trials):
                     }
                 )
 
-            steps_per_epoch = int(args.n_train / args.batch)
-            key, subkey = random.split(key)
+            steps_per_epoch = int(len(train_X) / args.batch)
             trained_model, _, _, _ = ml.train(
                 train_X,
                 train_y,
                 map_and_loss,
                 model,
-                subkey,
+                subkey2,
                 ml.EpochStop(epochs=args.epochs, verbose=args.verbose),
                 args.batch,
                 optax.adamw(
@@ -382,14 +416,13 @@ for t in range(args.n_trials):
             if args.save_model is not None:
                 ml.save(save_model, trained_model)
 
-        key, subkey1, subkey2, subkey3 = random.split(key, num=4)
         results[t, k, 0] = ml.map_loss_in_batches(
             ft.partial(map_and_loss, scaler=scaler),
             trained_model,
             train_X,
             train_y,
             args.batch,
-            subkey1,
+            subkey3,
             devices=jax.devices(),
         )
         results[t, k, 1] = ml.map_loss_in_batches(
@@ -398,7 +431,7 @@ for t in range(args.n_trials):
             val_X,
             val_y,
             args.batch,
-            subkey1,
+            subkey4,
             devices=jax.devices(),
         )
         results[t, k, 2] = ml.map_loss_in_batches(
@@ -407,7 +440,7 @@ for t in range(args.n_trials):
             test_X,
             test_y,
             args.batch,
-            subkey1,
+            subkey5,
             devices=jax.devices(),
         )
         print(f"{t},{model_name}: {results[t,k,2]}")
@@ -415,5 +448,5 @@ for t in range(args.n_trials):
 print(results)
 
 print("Test Errors")
-for k, (model_name, _, _, _) in enumerate(models_list):
+for k, (model_name, _, _, _, _) in enumerate(models_list):
     print(f"{model_name}: {jnp.mean(results[:, k, 2]):.3e} +- {jnp.std(results[:, k, 2]):.3e}")
