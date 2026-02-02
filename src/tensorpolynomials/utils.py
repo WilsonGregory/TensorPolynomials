@@ -282,7 +282,9 @@ def metric_tensor_basis_size(sig_orders: list[int], n: int) -> int:
     return total
 
 
-def get_tensor_basis_of_vecs(x: jax.Array, max_k: int, metric_tensor: jax.Array):
+def get_tensor_basis_of_vecs(
+    x: jax.Array, max_k: int, metric_tensor: jax.Array
+) -> dict[int, jax.Array]:
     """
     Construct the set of tensors that span the space of a function from vectors to tensors for
     orders 1 to max_k inclusive.
