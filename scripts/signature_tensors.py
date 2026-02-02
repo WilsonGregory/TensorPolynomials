@@ -200,6 +200,42 @@ class EquivSignature(eqx.Module):
         return out
 
 
+def augment_data(
+    train_X: jax.Array,
+    train_sig: jax.Array,
+    aug_multiplier: int,
+    orders: list[int],
+    key: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    batch, steps, D = train_X.shape
+
+    train_X_aug = jnp.full((aug_multiplier,) + train_X.shape, train_X[None])
+    train_X_aug = train_X_aug.reshape((batch * aug_multiplier, steps, D))
+
+    train_sig_aug = jnp.full((aug_multiplier,) + train_sig.shape, train_sig[None])
+    train_sig_aug = train_sig_aug.reshape((batch * aug_multiplier,) + train_sig.shape[1:])
+
+    key, subkey = random.split(key)
+    Qs = random.orthogonal(subkey, D, (batch * aug_multiplier,))
+    train_X_aug_rot = jnp.einsum(
+        "...ij,...j->...i",
+        jnp.full((len(Qs), steps, D, D), Qs[:, None]),
+        train_X_aug,
+        precision=jax.lax.Precision.HIGHEST,
+    )
+
+    train_sig_aug_rot = {}
+    for k, tensor in data.expand_signature(D, train_sig_aug, orders).items():
+        assert k > 0
+
+        einstr = "".join([f"...{utils.LETTERS[i]}{utils.LETTERS[i+26]}," for i in range(k)])
+        einstr += f"...{utils.LETTERS[26:26+k]}->...{utils.LETTERS[:k]}"
+        tensor_rot = jnp.einsum(einstr, *((Qs,) * k), tensor, precision=jax.lax.Precision.HIGHEST)
+        train_sig_aug_rot[k] = tensor_rot
+
+    return train_X_aug_rot, data.flatten_signature(train_sig_aug_rot)
+
+
 class Normalizer:
 
     INPUT_TYPES = ["norm", "gram", "standard"]
@@ -208,7 +244,6 @@ class Normalizer:
     D: int
     input_type: str | None
     output_type: str | None
-    n_train: int
     input_scale: jax.Array | float
     output_scale: dict[int, jax.Array]
     orders: list[int]
@@ -218,13 +253,11 @@ class Normalizer:
         D: int,
         input_type: str | None,
         output_type: str | None,
-        n_train: int,
         orders: list[int],
     ) -> None:
         self.D = D
         self.input_type = input_type
         self.output_type = output_type
-        self.n_train = n_train
         self.orders = orders
 
     def input(self: Self, vectors: jax.Array, *extra_vectors: jax.Array) -> tuple[jax.Array, ...]:
@@ -236,7 +269,7 @@ class Normalizer:
             extra_vectors: input vectors for the test or validation set, normalize based on train set
         """
         if self.input_type == "norm":
-            self.input_scale = jnp.std(jnp.linalg.norm(vectors), axis=-1)
+            self.input_scale = jnp.std(jnp.linalg.norm(vectors, axis=-1))
         elif self.input_type == "gram":
             batch, steps, _ = vectors.shape
 
@@ -273,6 +306,7 @@ class Normalizer:
         args:
             flat_signature: list of jax arrays of shape (batch, (D,)*k)
         """
+        batch = len(signature_flat)
         extra_signatures = [
             data.expand_signature(self.D, sig_flat, self.orders)
             for sig_flat in extra_signatures_flat
@@ -287,7 +321,12 @@ class Normalizer:
             )
             self.output_scale = {k: jnp.std(signature_flat) for k in self.orders}
 
-        if self.output_type == "align_basis":
+        if self.output_type == "norm":
+            # scale the tensor signatures so that their expected norm is 1.
+            self.output_scale = {}
+            for k, t in signature.items():
+                self.output_scale[k] = jnp.std(jnp.linalg.norm(t.reshape((batch, -1)), axis=-1))
+        elif self.output_type == "align_basis":
             assert vectors is not None
             # scale the output tensors so that the standard deviations of their norm match
             # the standard deviation of the norm of the basis elements
@@ -297,16 +336,14 @@ class Normalizer:
             self.output_scale = {}
             for k, t in signature.items():
                 std_basis = jnp.std(jnp.linalg.norm(kth_basis[k].reshape((-1, D**k)), axis=-1))
-                std_t = jnp.std(jnp.linalg.norm(t.reshape((self.n_train, -1)), axis=-1))
+                std_t = jnp.std(jnp.linalg.norm(t.reshape((batch, -1)), axis=-1))
                 self.output_scale[k] = std_t / std_basis
 
         elif self.output_type == "mean_norm":
             # scale the tensor signatures so that their expected norm is 1.
             self.output_scale = {}
             for k, t in signature.items():
-                self.output_scale[k] = jnp.mean(
-                    jnp.linalg.norm(t.reshape((self.n_train, -1)), axis=-1)
-                )
+                self.output_scale[k] = jnp.mean(jnp.linalg.norm(t.reshape((batch, -1)), axis=-1))
 
         elif self.output_type is None:
             self.output_scale = {k: jnp.ones(1) for k in self.orders}
@@ -500,46 +537,65 @@ train_X, train_sig, val_X, val_sig, test_X, test_sig, sig_orders = get_data(
     key,
 )
 
-key, subkey1, subkey2, subkey3, subkey4 = random.split(key, num=5)
+key, subkey1, subkey2, subkey3, subkey4, subkey5 = random.split(key, num=6)
 models_list = [
     (
         "signax_only",
         1,
         SignaxOnly(D, sig_orders),
-        Normalizer(D, None, None, args.n_train, sig_orders),
+        1,
+        Normalizer(D, None, None, sig_orders),
     ),
     (
         "tensor_poly",
-        1e-3,  # 1e-3 for piecewise_linear
+        5e-4,  # 1e-3 for piecewise_linear
         EquivSignature(sig_orders, steps, 32, 3, False, subkey1),
-        Normalizer(D, "gram", "mean_norm", args.n_train, sig_orders),
+        1,
+        Normalizer(D, "gram", "mean_norm", sig_orders),
     ),
     (
         "baseline_samewidth",
         5e-3,
         Baseline(D, sig_orders, steps, 32, 3, subkey4),
-        Normalizer(D, "standard", "standard", args.n_train, sig_orders),
+        1,
+        Normalizer(D, "standard", "standard", sig_orders),
     ),
     (
         "baseline_sameparams",
         1e-3,
         Baseline(D, sig_orders, steps, 128, 3, subkey3),
-        Normalizer(D, "standard", "standard", args.n_train, sig_orders),
+        1,
+        Normalizer(D, "standard", "standard", sig_orders),
+    ),
+    (
+        "baseline_sameparams_aug4",
+        1e-3,
+        Baseline(D, sig_orders, steps, 128, 3, subkey5),
+        4,
+        Normalizer(D, "norm", "norm", sig_orders),
     ),
 ]
 
 results = np.zeros((args.n_trials, len(models_list), 3))
 for t in range(args.n_trials):
-    for k, (model_name, lr, model, normalizer) in enumerate(models_list):
+    for k, (model_name, lr, model, aug_multiplier, normalizer) in enumerate(models_list):
+        key, subkey1, subkey2, subkey3, subkey4, subkey5 = random.split(key, num=6)
 
         print(f"{model_name}: {count_params(model):,} params")
 
         name = f"signature_{model_name}_t{t}_lr{lr}_e{args.epochs}_ntrain{args.n_train}"
         save_model = f"{args.save_model}/{name}.eqx" if args.save_model is not None else None
 
-        train_X_norm, val_X_norm, test_X_norm = normalizer.input(train_X, val_X, test_X)
+        if aug_multiplier > 1:
+            train_X_aug, train_sig_aug = augment_data(
+                train_X, train_sig, aug_multiplier, sig_orders, subkey1
+            )
+        else:
+            train_X_aug, train_sig_aug = train_X, train_sig
+
+        train_X_norm, val_X_norm, test_X_norm = normalizer.input(train_X_aug, val_X, test_X)
         train_sig_norm, val_sig_norm, test_sig_norm = normalizer.output(
-            train_sig, train_X_norm, val_sig, test_sig
+            train_sig_aug, train_X_norm, val_sig, test_sig
         )
 
         if args.load_model:
@@ -563,18 +619,16 @@ for t in range(args.n_trials):
                     }
                 )
 
-            steps_per_epoch = int(args.n_train / args.batch)
+            steps_per_epoch = int(len(train_X_norm) / args.batch)
 
             # normalizer values will be set for val set, not train
-            key, subkey = random.split(key)
             trained_model, _, _, _ = ml.train(
                 train_X_norm,
                 train_sig_norm,
                 ft.partial(map_and_loss, sig_orders=sig_orders),
                 model,
-                subkey,
+                subkey2,
                 ml.EpochStop(args.epochs, verbose=args.verbose),
-                # ml.ValLoss(patience=100, max_epochs=args.epochs, verbose=args.verbose),
                 args.batch,
                 optax.adamw(
                     optax.cosine_onecycle_schedule(args.epochs * steps_per_epoch, lr, div_factor=3)
@@ -594,14 +648,13 @@ for t in range(args.n_trials):
             if args.save_model is not None:
                 ml.save(save_model, trained_model)
 
-        key, subkey1, subkey2, subkey3 = random.split(key, num=4)
         results[t, k, 0] = ml.map_loss_in_batches(
             ft.partial(map_and_loss, sig_orders=sig_orders, normalizer=normalizer),
             trained_model,
             train_X_norm,
             train_sig_norm,
             args.batch,
-            subkey1,
+            subkey3,
             devices=jax.devices(),
         )
         results[t, k, 1] = ml.map_loss_in_batches(
@@ -610,7 +663,7 @@ for t in range(args.n_trials):
             val_X_norm,
             val_sig_norm,
             args.batch,
-            subkey2,
+            subkey4,
             devices=jax.devices(),
         )
         results[t, k, 2] = ml.map_loss_in_batches(
@@ -619,11 +672,11 @@ for t in range(args.n_trials):
             test_X_norm,
             test_sig_norm,
             args.batch,
-            subkey3,
+            subkey5,
             devices=jax.devices(),
         )
         print(f"{t},{model_name}: {results[t,k,2]}")
 
 print("Test Errors")
-for k, (model_name, _, _, _) in enumerate(models_list):
+for k, (model_name, _, _, _, _) in enumerate(models_list):
     print(f"{model_name}: {jnp.mean(results[:, k, 2]):.3e} +- {jnp.std(results[:, k, 2]):.3e}")
