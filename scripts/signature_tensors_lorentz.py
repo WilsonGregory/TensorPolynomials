@@ -138,7 +138,9 @@ def augment_data(
     train_sig_aug = train_sig_aug.reshape((lenQ,) + train_sig.shape[1:])
 
     key, subkey1, subkey2, subkey3 = random.split(key, num=4)
-    beta = random.uniform(subkey1, (lenQ, D - 1), minval=-1 / D, maxval=1 / D)
+    beta = random.truncated_normal(
+        subkey1, -jnp.sqrt(1 / (D - 1)), jnp.sqrt(1 / (D - 1)), (lenQ, D - 1)
+    )
     beta_norm = jnp.linalg.norm(beta, axis=1)
     assert jnp.max(beta_norm**2) < 1  # boost cannot be faster than speed of light
     gamma = 1 / jnp.sqrt(1 - beta_norm**2)
