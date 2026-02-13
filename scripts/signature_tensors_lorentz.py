@@ -96,7 +96,7 @@ class EquivSignature(eqx.Module):
     def __call__(self: Self, x: jax.Array) -> jax.Array:
         n, D = x.shape
 
-        # the metric tensor for the Lorentz group
+        # the metric tensor for the Lorentz group. Dont save to avoid "training" it
         id = jnp.eye(D)
         id = id.at[0, 0].set(-1)
 
@@ -121,7 +121,6 @@ class EquivSignature(eqx.Module):
         return out
 
 
-# TODO: for lorentz this needs to be updated
 def augment_data(
     train_X: jax.Array,
     train_sig: jax.Array,
@@ -130,15 +129,40 @@ def augment_data(
     key: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
     batch, steps, D = train_X.shape
+    lenQ = batch * aug_multiplier
 
     train_X_aug = jnp.full((aug_multiplier,) + train_X.shape, train_X[None])
-    train_X_aug = train_X_aug.reshape((batch * aug_multiplier, steps, D))
+    train_X_aug = train_X_aug.reshape((lenQ, steps, D))
 
     train_sig_aug = jnp.full((aug_multiplier,) + train_sig.shape, train_sig[None])
-    train_sig_aug = train_sig_aug.reshape((batch * aug_multiplier,) + train_sig.shape[1:])
+    train_sig_aug = train_sig_aug.reshape((lenQ,) + train_sig.shape[1:])
 
-    key, subkey = random.split(key)
-    Qs = random.orthogonal(subkey, D, (batch * aug_multiplier,))
+    key, subkey1, subkey2, subkey3 = random.split(key, num=4)
+    beta = random.truncated_normal(
+        subkey1, -jnp.sqrt(1 / (D - 1)), jnp.sqrt(1 / (D - 1)), (lenQ, D - 1)
+    )
+    beta_norm = jnp.linalg.norm(beta, axis=1)
+    assert jnp.max(beta_norm**2) < 1  # boost cannot be faster than speed of light
+    gamma = 1 / jnp.sqrt(1 - beta_norm**2)
+
+    beta_matrix_scaling = ((gamma - 1) / beta_norm)[:, None, None]
+    beta_matrix = jnp.eye(D - 1)[None] + (beta[:, :, None] * beta[:, None, :]) * beta_matrix_scaling
+
+    boost = jnp.zeros((lenQ, D, D))
+    boost = boost.at[:, 0, 0].set(gamma)
+    boost = boost.at[:, 0, 1:].set(beta * -gamma[:, None])
+    boost = boost.at[:, 1:, 0].set(beta * -gamma[:, None])
+    boost = boost.at[:, 1:, 1:].set(beta_matrix)  # (lenQ,D,D)
+
+    rot = random.orthogonal(subkey2, D - 1, (lenQ,))  # (lenQ,D-1,D-1)
+    time_flip = random.bernoulli(subkey3, shape=(lenQ,)) * 2 - 1  # (lenQ,) coinflip +-1
+    rot_time_flip = jnp.zeros((lenQ, D, D))
+    rot_time_flip = rot_time_flip.at[:, 0, 0].set(time_flip)
+    rot_time_flip = rot_time_flip.at[:, 1:, 1:].set(rot)  # (lenQ,D,D)
+
+    # now construct the elements of the lorentz group with boost, spatial rotation, and time flip
+    Qs = jnp.einsum("...ij,...jk->...ik", boost, rot_time_flip, precision=jax.lax.Precision.HIGHEST)
+
     train_X_aug_rot = jnp.einsum(
         "...ij,...j->...i",
         jnp.full((len(Qs), steps, D, D), Qs[:, None]),
@@ -169,6 +193,7 @@ class Normalizer:
     input_scale: jax.Array | float
     output_scale: dict[int, jax.Array]
     orders: list[int]
+    metric_tensor: jax.Array
 
     def __init__(
         self: Self,
@@ -176,11 +201,13 @@ class Normalizer:
         input_type: str | None,
         output_type: str | None,
         orders: list[int],
+        metric_tensor: jax.Array | None = None,
     ) -> None:
         self.D = D
         self.input_type = input_type
         self.output_type = output_type
         self.orders = orders
+        self.metric_tensor = jnp.eye(D) if metric_tensor is None else metric_tensor
 
     def input(self: Self, vectors: jax.Array, *extra_vectors: jax.Array) -> tuple[jax.Array, ...]:
         """
@@ -190,13 +217,13 @@ class Normalizer:
             vectors: input train vectors, shape (batch,steps,D)
             extra_vectors: input vectors for the test or validation set, normalize based on train set
         """
-        if self.input_type == "norm":
-            self.input_scale = jnp.std(jnp.linalg.norm(vectors, axis=-1))
-        elif self.input_type == "gram":
-            batch, steps, _ = vectors.shape
+        batch, steps, _ = vectors.shape
 
-            # (b,steps,steps)
-            X = jnp.einsum("...ij,...kj->...ik", vectors, vectors)
+        if self.input_type == "norm":
+            self.input_scale = jnp.std(utils.metric_tensor_norm(vectors, self.metric_tensor, 2))
+        elif self.input_type == "gram":
+            id_full = jnp.full((batch, self.D, self.D), self.metric_tensor)  # (batch,D,D)
+            X = jnp.einsum("...ij,...jk,...lk->...il", vectors, id_full, vectors)  # (b,steps,steps)
             X = X[:, jnp.triu_indices(steps)].reshape((batch, -1))  # (b,gram matrix dim)
             # sqrt of std because we are applying it to each vector
             self.input_scale = jnp.sqrt(jnp.std(X))
@@ -247,25 +274,30 @@ class Normalizer:
             # scale the tensor signatures so that their expected norm is 1.
             self.output_scale = {}
             for k, t in signature.items():
-                self.output_scale[k] = jnp.std(jnp.linalg.norm(t.reshape((batch, -1)), axis=-1))
+                self.output_scale[k] = jnp.std(utils.metric_tensor_norm(t, self.metric_tensor, 1))
+
         elif self.output_type == "align_basis":
             assert vectors is not None
             # scale the output tensors so that the standard deviations of their norm match
             # the standard deviation of the norm of the basis elements
             vmap_tensor_basis = jax.vmap(utils.get_tensor_basis_of_vecs, in_axes=(0, None, None))
-            kth_basis = vmap_tensor_basis(vectors, len(signature), jnp.eye(D))
+            kth_basis = vmap_tensor_basis(vectors, len(signature), self.metric_tensor)
 
             self.output_scale = {}
             for k, t in signature.items():
-                std_basis = jnp.std(jnp.linalg.norm(kth_basis[k].reshape((-1, D**k)), axis=-1))
-                std_t = jnp.std(jnp.linalg.norm(t.reshape((batch, -1)), axis=-1))
+                std_basis = jnp.std(
+                    utils.metric_tensor_norm(
+                        kth_basis[k].reshape((-1,) + (D,) * k), self.metric_tensor, 1
+                    )
+                )
+                std_t = jnp.std(utils.metric_tensor_norm(t, self.metric_tensor, 1))
                 self.output_scale[k] = std_t / std_basis
 
         elif self.output_type == "mean_norm":
             # scale the tensor signatures so that their expected norm is 1.
             self.output_scale = {}
             for k, t in signature.items():
-                self.output_scale[k] = jnp.mean(jnp.linalg.norm(t.reshape((batch, -1)), axis=-1))
+                self.output_scale[k] = jnp.mean(utils.metric_tensor_norm(t, self.metric_tensor, 1))
 
         elif self.output_type is None:
             self.output_scale = {k: jnp.ones(1) for k in self.orders}
@@ -326,6 +358,7 @@ def map_and_loss(
     loss_per_tensor = jnp.zeros((batch, 0))
     for pred_tensor, y_tensor in zip(pred_signature.values(), y_signature.values()):
         pred_tensor, y_tensor = pred_tensor.reshape((batch, -1)), y_tensor.reshape((batch, -1))
+        # TODO: this is the mse loss, which for lorentz tensors is not an equivariant loss
         loss_per_tensor = jnp.concatenate(
             [
                 loss_per_tensor,
@@ -339,6 +372,7 @@ def map_and_loss(
     return jnp.mean(loss_per_tensor), aux_data
 
 
+# Typical run: defaults, as well as -e 500 -t 3
 def handleArgs(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--epochs", help="number of epochs to run", type=int, default=50)
@@ -384,6 +418,10 @@ sig_order = 3
 sig_orders = list(range(1, 1 + sig_order))
 steps = 10
 
+# the metric tensor for the Lorentz group
+metric_tensor = jnp.eye(D)
+metric_tensor = metric_tensor.at[0, 0].set(-1)
+
 key = random.PRNGKey(time.time_ns() if args.seed is None else args.seed)
 key, subkey = random.split(key)
 train_X, train_sig, val_X, val_sig, test_X, test_sig = get_data(
@@ -398,30 +436,36 @@ models_list = [
         5e-4,
         EquivSignature(sig_orders, steps, 32, 3, subkey1),
         1,
-        Normalizer(D, "gram", "mean_norm", sig_orders),
+        Normalizer(D, "gram", "mean_norm", sig_orders, metric_tensor),
     ),
     (
         "baseline_samewidth",
         5e-3,
         Baseline(D, sig_order, steps, 32, 3, subkey2),
         1,
-        Normalizer(D, "standard", "standard", sig_orders),
+        Normalizer(D, "standard", "standard", sig_orders, metric_tensor),
     ),
     (
         "baseline_sameparams116",
         1e-3,
         Baseline(D, sig_order, steps, 116, 3, subkey3),
         1,
-        Normalizer(D, "standard", "standard", sig_orders),
+        Normalizer(D, "standard", "standard", sig_orders, metric_tensor),
     ),
     (
         "baseline_aug",
         1e-3,
         Baseline(D, sig_order, steps, 116, 3, subkey4),
         4,
-        Normalizer(D, "norm", "norm", sig_orders),
+        Normalizer(D, "norm", "norm", sig_orders, metric_tensor),
     ),
-    ("signax_only", 1, SignaxOnly(sig_order), 1, Normalizer(D, None, None, sig_orders)),
+    (
+        "signax_only",
+        1,
+        SignaxOnly(sig_order),
+        1,
+        Normalizer(D, None, None, sig_orders, metric_tensor),
+    ),
 ]
 
 results = np.zeros((args.n_trials, len(models_list), 3))

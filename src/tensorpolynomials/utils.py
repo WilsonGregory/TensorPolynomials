@@ -344,3 +344,30 @@ def get_tensor_basis_of_vecs(
         kth_basis_full[k] = basis
 
     return kth_basis_full
+
+
+def metric_tensor_norm(t: jax.Array, metric_tensor: jax.Array, n_batch: int = 0) -> jax.Array:
+    """
+    Get the squared frobenius norm of the tensor, relative to the passed metric_tensor.
+
+    args:
+        t: tensor shape (batch,tensor)
+        metric_tensor: shape (D,D)
+        n_batch: number of leading batch axes
+
+    returns:
+        norm of the tensors, shape (batch,)
+    """
+    D = len(metric_tensor)
+    k = t.ndim - n_batch
+
+    assert metric_tensor.shape == (D, D)
+    assert k >= 0
+    assert k < 13
+    assert t.shape[n_batch:] == (D,) * k
+
+    id_full = jnp.full(t.shape[:n_batch] + (D, D), metric_tensor.reshape((1,) * n_batch + (D, D)))
+    id_ein_str = ",".join([f"...{LETTERS[i]}{LETTERS[i + 13]}" for i in range(k)])
+    ein_str = f"...{LETTERS[:k]},...{LETTERS[13:13+k]},{id_ein_str}"
+    tensor_inputs = (t, t) + (id_full,) * k
+    return jnp.einsum(ein_str, *tensor_inputs)
