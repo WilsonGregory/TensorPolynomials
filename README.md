@@ -1,5 +1,5 @@
 # TensorPolynomials
-Library to compute general polynomials from tensors to tensors in JAX. This is the code to reproduce the experiments in the paper https://arxiv.org/abs/2406.01552. 
+Library to compute general polynomials from tensors to tensors in JAX. This is the code to reproduce the experiments in the paper https://openreview.net/forum?id=1FCZ4f8dAY.
 
 ## Installation
 
@@ -24,13 +24,12 @@ The models are in the models.py file.
 
 If you use this code in a published work, please cite:
 ```
-@misc{gregory2024learningequivarianttensorfunctions,
-      title={Learning equivariant tensor functions with applications to sparse vector recovery}, 
-      author={Wilson G. Gregory and Josué Tonelli-Cueto and Nicholas F. Marshall and Andrew S. Lee and Soledad Villar},
-      year={2024},
-      eprint={2406.01552},
-      archivePrefix={arXiv},
-      primaryClass={stat.ML},
-      url={https://arxiv.org/abs/2406.01552}, 
+@inproceedings{
+      gregory2026tensor,
+      title={Tensor learning with orthogonal, Lorentz, and symplectic symmetries},
+      author={Wilson G. Gregory and Josu{\'e} Tonelli-Cueto and Nicholas F. Marshall and Andrew S. Lee and Soledad Villar},
+      booktitle={The Fourteenth International Conference on Learning Representations},
+      year={2026},
+      url={https://openreview.net/forum?id=1FCZ4f8dAY}
 }
 ```
